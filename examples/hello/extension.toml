@@ -1,0 +1,30 @@
+# The template's `hello` extension as a Rust binary. Rename `hello` (the id, and every command, tool
+# and event name that starts with it) to start your own.
+[extension]
+id = "hello"
+name = "Hello"
+version = "0.1.0"
+publisher = "aurelio"
+summary = "A template: one command that writes a greeting to a file."
+node = ">=0.1,<1"
+platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
+
+[run]
+command = ["bin/hello"]      # the release build, in the package's bin/
+runtime = "binary"
+
+[permissions]
+secrets = []                 # vault names it may open, or prefixes like "hello.*"
+
+[[commands]]
+kind = "hello.greet"
+title = "Greet"
+params = {type = "object", properties = {name = {type = "string"}}, required = ["name"]}
+lane = "main"                # commands in a lane run one at a time
+
+[settings]
+type = "object"
+
+[settings.properties.greeting]
+type = "string"
+default = "Hello"

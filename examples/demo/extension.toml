@@ -1,0 +1,71 @@
+# Every part of the Rust SDK in one extension, for the SDK's own tests (tests/demo.rs, tests/protocol.rs).
+[extension]
+id = "demo"
+name = "Demo"
+version = "0.2.0"
+publisher = "aurelio"
+summary = "Every part of the Rust SDK, for its own tests."
+node = ">=0.1,<1"
+platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
+
+[run]
+command = ["bin/demo"]
+runtime = "binary"
+
+[permissions]
+secrets = ["demo.*", "shared.key"]
+
+[settings]
+type = "object"
+
+[settings.properties.label]
+type = "string"
+default = "demo"
+
+[settings.properties.limit]
+type = "integer"
+default = 3
+
+[[commands]]
+kind = "demo.echo"
+title = "Echo its params"
+params = {type = "object"}
+
+[[commands]]
+kind = "demo.step"
+title = "Count, a checkpoint each step"
+params = {type = "object", properties = {steps = {type = "integer"}, step_ms = {type = "integer"}}}
+lane = "main"
+cancellable = true
+resumable = true
+
+[[commands]]
+kind = "demo.fail"
+title = "Fail as asked"
+params = {type = "object", properties = {how = {type = "string"}, message = {type = "string"}}}
+
+[[commands]]
+kind = "demo.secret"
+title = "Open or list secrets"
+params = {type = "object", properties = {name = {type = "string"}, prefix = {type = "string"}}}
+
+[[commands]]
+kind = "demo.allowed"
+title = "Check a path"
+params = {type = "object", properties = {path = {type = "string"}}, required = ["path"]}
+
+[[events]]
+name = "demo.started"
+description = "The node and settings it started with."
+
+[[events]]
+name = "demo.settings"
+description = "The settings, each time they change."
+
+[[events]]
+name = "demo.tick"
+description = "How many times its periodic task has run."
+
+[[events]]
+name = "demo.echo"
+description = "The last params echoed."
