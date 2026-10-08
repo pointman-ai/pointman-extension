@@ -58,10 +58,10 @@ fn main() -> anyhow::Result<()> {
     ext.pane("board", |pane: &Pane| {
         let board = Arc::new(Mutex::new(json!({
             "project": {"key": "ALA", "title": "Spark", "leading_tool": "linear"},
-            "states": [{"name": "In Progress", "category": "started"}, {"name": "Done", "category": "done"}],
+            "states": [{"name": "In Progress", "category": "active"}, {"name": "Done", "category": "done"}],
             "items": [
-                {"id": "lin_1", "ref": "ALA-1", "title": "One", "state": "In Progress", "category": "started"},
-                {"id": "lin_parent", "ref": "ALA-2", "title": "Parent", "state": "In Progress", "category": "started"}]})));
+                {"id": "lin_1", "ref": "ALA-1", "title": "One", "state": "In Progress", "category": "active"},
+                {"id": "lin_parent", "ref": "ALA-2", "title": "Parent", "state": "In Progress", "category": "active"}]})));
         let now = board.clone();
         pane.on_input(move |pane: &Pane, event: &Value| -> anyhow::Result<()> {
             let kind = event["kind"].as_str().unwrap_or_default();
@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
                     if item == "lin_parent" && to == "Done" {
                         bail!(Refused::new("Linear decides when parents close"));
                     }
-                    let category = if to == "Done" { "done" } else { "started" };
+                    let category = if to == "Done" { "done" } else { "active" };
                     pane.update_item(item, json!({"state": to, "category": category}));
                     let mut board = now.lock().unwrap();
                     if let Some(it) = board["items"].as_array_mut().unwrap().iter_mut().find(|i| i["id"] == item) {

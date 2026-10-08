@@ -979,10 +979,12 @@ impl View {
                 }
                 "pane.patch" => match apply_patch(&state.content, &p["patch"]) {
                     Ok(content) => {
-                        if state.format.as_deref() == Some("blocks") {
-                            let problems = block_problems(&content);
-                            state.problems.extend(problems);
-                        }
+                        let problems = match state.format.as_deref() {
+                            Some("blocks") => block_problems(&content),
+                            Some("board") => board_problems(&content),
+                            _ => Vec::new(),
+                        };
+                        state.problems.extend(problems);
                         state.content = content;
                     }
                     Err(e) => state.problems.push(format!("patch: {e}")),
@@ -1018,8 +1020,46 @@ fn set_problems(format: Option<&str>, content: &Value) -> Vec<String> {
     }
     if format == Some("blocks") {
         problems.extend(block_problems(content));
-    } else if !content["items"].is_array() {
-        problems.push("a board is an object with items".into());
+    } else {
+        problems.extend(board_problems(content));
+    }
+    problems
+}
+
+/// projects.md's seven categories: a board's states and items each have one.
+pub const CATEGORIES: [&str; 7] = ["triage", "backlog", "todo", "active", "review", "done", "dropped"];
+
+/// The little a stand-in checks of a board: items with an id each, used once, and every state's and
+/// item's category one of the seven.
+pub fn board_problems(board: &Value) -> Vec<String> {
+    let Some(items) = board["items"].as_array() else { return vec!["a board is an object with items".into()] };
+    let mut problems = Vec::new();
+    let category = |v: &Value| v.as_str().is_some_and(|c| CATEGORIES.contains(&c));
+    for (i, state) in board["states"].as_array().into_iter().flatten().enumerate() {
+        if !category(&state["category"]) {
+            problems.push(format!(
+                "states[{i}] ({}): {} isn't one of {}",
+                state["name"],
+                state["category"],
+                CATEGORIES.join(", ")
+            ));
+        }
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        match item["id"].as_str().filter(|id| !id.is_empty()) {
+            None => problems.push(format!("items[{i}] has no id")),
+            Some(id) if seen.contains(&id) => problems.push(format!("items[{i}]: the id '{id}' is used twice")),
+            Some(id) => seen.push(id),
+        }
+        if item.get("category").is_some() && !category(&item["category"]) {
+            problems.push(format!(
+                "items[{i}] ({}): {} isn't one of {}",
+                item["id"],
+                item["category"],
+                CATEGORIES.join(", ")
+            ));
+        }
     }
     problems
 }
@@ -1202,7 +1242,7 @@ fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allows_secret, apply_patch, block_problems};
+    use super::{allows_secret, apply_patch, block_problems, board_problems};
     use crate::pointer;
     use serde_json::{json, Value};
 
@@ -1258,6 +1298,19 @@ mod tests {
             let e = apply_patch(&blocks, &json!([bad])).unwrap_err();
             assert!(e.contains(why), "{e}");
         }
+    }
+
+    #[test]
+    fn boards_need_the_seven_categories_and_ids_once() {
+        let board = json!({"states": [{"name": "In Progress", "category": "started"}, {"name": "Done", "category": "done"}],
+                           "items": [{"id": "a", "category": "active"}, {"id": "a"}, {"category": "nope"}]});
+        assert_eq!(board_problems(&board), [
+            "states[0] (\"In Progress\"): \"started\" isn't one of triage, backlog, todo, active, review, done, dropped",
+            "items[1]: the id 'a' is used twice",
+            "items[2] has no id",
+            "items[2] (null): \"nope\" isn't one of triage, backlog, todo, active, review, done, dropped",
+        ]);
+        assert_eq!(board_problems(&json!({"items": []})), Vec::<String>::new());
     }
 
     #[test]
