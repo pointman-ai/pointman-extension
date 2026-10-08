@@ -1091,14 +1091,21 @@ pub fn apply_patch(content: &Value, ops: &Value) -> Result<Value, String> {
     Ok(out)
 }
 
-/// A patch path as plain tokens from the content's root, through the block or item it names.
+/// A patch path as plain tokens from the content's root, through the block or item it names, or a plain
+/// pointer from the top of the content as a set sends it (`/blocks/…`, `/board/…`).
 fn locate(content: &Value, path: &str) -> Result<Vec<String>, String> {
     let tokens: Vec<String> = match path.strip_prefix('/') {
         Some(rest) => rest.split('/').map(|t| t.replace("~1", "/").replace("~0", "~")).collect(),
         None => Vec::new(),
     };
+    let top = if content.is_array() { "blocks" } else { "board" };
+    if tokens.len() >= 2 && tokens[0] == top {
+        return Ok(tokens[1..].to_vec());
+    }
     if tokens.len() < 2 || (tokens[0] != "b" && tokens[0] != "i") {
-        return Err(format!("'{path}': a pane's patch paths start /b/<block id> or /i/<item id>"));
+        return Err(format!(
+            "'{path}': a pane's patch paths start /b/<block id> or /i/<item id>, or /{top}/ from the top"
+        ));
     }
     let base = if tokens[0] == "b" {
         content.as_array().and_then(|blocks| find_block(blocks, &tokens[1]))
@@ -1234,6 +1241,14 @@ mod tests {
         let board = json!({"items": [{"id": "i1", "state": "Todo"}]});
         let moved = apply_patch(&board, &json!([{"op": "replace", "path": "/i/i1/state", "value": "Done"}])).unwrap();
         assert_eq!(moved["items"][0]["state"], "Done");
+        // plain pointers from the top of the content, as a set sends it: {"blocks": […]} or {"board": {…}}
+        let grown =
+            apply_patch(&board, &json!([{"op": "add", "path": "/board/items/-", "value": {"id": "i2"}}])).unwrap();
+        assert_eq!(grown["items"][1]["id"], "i2");
+        let more =
+            apply_patch(&blocks, &json!([{"op": "add", "path": "/blocks/-", "value": {"type": "text", "id": "y"}}]));
+        assert_eq!(more.unwrap()[2]["id"], "y");
+        assert!(apply_patch(&blocks, &json!([{"op": "add", "path": "/board/items/-", "value": {}}])).is_err());
         for (bad, why) in [
             (json!({"op": "replace", "path": "/0/markdown", "value": 1}), "start /b/<block id>"),
             (json!({"op": "replace", "path": "/b/nope/x", "value": 1}), "no block 'nope'"),
