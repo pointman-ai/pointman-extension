@@ -21,6 +21,10 @@
 //! waits for them, and answers what the extension asks: secrets only within its permissions, as the
 //! node does, from the fakes it's given. What it doesn't do: the node's restarts, checkpoint files,
 //! params checked against the manifest's schemas, or anything reaching the board.
+//!
+//! Panes open as the node opens them, and keep their content as an app would, with each set and
+//! patch applied ([`StandIn::open_pane`], [`PaneView`]). It checks blocks only for an id each,
+//! unique in the pane, and a type; the node checks them fully.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -42,8 +46,11 @@ use crate::{guarded, id_text, load_manifest, lock, resolve, PROTOCOL};
 /// What a stand-in passes on from its own environment, as a node does: never the board's tokens.
 pub const ENV_KEEP: [&str; 7] = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "PYTHONUTF8"];
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// A pane's frame, as the stream's limit: 1 MiB.
+pub const FRAME_MAX: usize = 1 << 20;
 
 type MethodFn = Arc<dyn Fn(Value) -> anyhow::Result<Value> + Send + Sync>;
+type ThenFn = Box<dyn FnOnce(&Value) + Send>;
 
 /// A command failed, or the extension didn't answer. Its Display is the extension's own message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +116,26 @@ pub struct RunOptions {
 impl Default for RunOptions {
     fn default() -> Self {
         RunOptions { timeout: CALL_TIMEOUT, cid: None, checkpoint: None }
+    }
+}
+
+/// How to open one pane: `PaneOptions { context: json!({"thread": "thr_1"}), ..Default::default() }`.
+#[derive(Debug, Clone)]
+pub struct PaneOptions {
+    /// What the person is looking at.
+    pub context: Value,
+    /// Who: `{person, device}` (`james` on `test-device` when not given).
+    pub viewer: Value,
+    pub timeout: Duration,
+}
+
+impl Default for PaneOptions {
+    fn default() -> Self {
+        PaneOptions {
+            context: json!({}),
+            viewer: json!({"person": "james", "device": "test-device"}),
+            timeout: CALL_TIMEOUT,
+        }
     }
 }
 
@@ -314,6 +341,8 @@ impl StandIn {
             stdin: Mutex::new(stdin),
             ids: AtomicU64::new(0),
             pending: Mutex::default(),
+            then: Mutex::default(),
+            panes: Mutex::default(),
             runs: Mutex::default(),
             events: Mutex::default(),
             changed: Condvar::new(),
@@ -447,6 +476,29 @@ impl StandIn {
         self.live()?.shared.request("settings.changed", json!({"settings": settings}), CALL_TIMEOUT).map(drop)
     }
 
+    /// Open one of its `[[panes]]`, as the node does for an app, and wait for its answer.
+    pub fn open_pane(&self, open: &str, target: Value) -> Result<PaneView, Failed> {
+        self.open_pane_with(open, target, PaneOptions::default())
+    }
+
+    pub fn open_pane_with(&self, open: &str, target: Value, options: PaneOptions) -> Result<PaneView, Failed> {
+        let s = &self.live()?.shared;
+        let pid = format!("pane_{}", s.ids.fetch_add(1, Ordering::SeqCst) + 1);
+        let view = Arc::new(View { id: pid.clone(), state: Mutex::default(), changed: Condvar::new() });
+        lock(&s.panes).insert(pid.clone(), view.clone());
+        let target = if target.is_null() { json!({}) } else { target };
+        let params = json!({
+            "pane": pid, "open": open, "target": target, "context": options.context, "viewer": options.viewer,
+        });
+        let opened = view.clone();
+        let then: ThenFn = Box::new(move |answer: &Value| opened.took("opened", answer, false));
+        if let Err(e) = s.request_then("pane.open", params, options.timeout, Some(then)) {
+            lock(&s.panes).remove(&pid);
+            return Err(e);
+        }
+        Ok(PaneView { shared: s.clone(), view })
+    }
+
     /// Each event's latest data, by name, as an object: `node.events()["hello.last"]`.
     pub fn events(&self) -> Value {
         self.live.as_ref().map(|l| Value::Object(lock(&l.shared.events).clone())).unwrap_or_else(|| json!({}))
@@ -550,6 +602,9 @@ struct Shared {
     stdin: Mutex<Option<ChildStdin>>,
     ids: AtomicU64,
     pending: Mutex<HashMap<u64, Sender<Answer>>>,
+    /// What to do with an answer on the reading thread, before anything sent after it.
+    then: Mutex<HashMap<u64, ThenFn>>,
+    panes: Mutex<HashMap<String, Arc<View>>>,
     runs: Mutex<HashMap<String, Running>>,
     events: Mutex<Map<String, Value>>,
     changed: Condvar,
@@ -583,13 +638,27 @@ impl Shared {
     }
 
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, Failed> {
+        self.request_then(method, params, timeout, None)
+    }
+
+    fn request_then(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        then: Option<ThenFn>,
+    ) -> Result<Value, Failed> {
         let rid = self.ids.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel();
         lock(&self.pending).insert(rid, tx);
+        if let Some(then) = then {
+            lock(&self.then).insert(rid, then);
+        }
         let answer = self
             .send(&json!({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
             .map(|()| rx.recv_timeout(timeout));
         lock(&self.pending).remove(&rid);
+        lock(&self.then).remove(&rid);
         match answer? {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(failed)) => Err(failed),
@@ -624,15 +693,18 @@ impl Shared {
                 }
             };
             if msg.get("method").is_none() {
-                if let Some(tx) =
-                    msg.get("id").and_then(Value::as_u64).and_then(|rid| lock(&self.pending).get(&rid).cloned())
-                {
+                let rid = msg.get("id").and_then(Value::as_u64);
+                if let Some(tx) = rid.and_then(|rid| lock(&self.pending).get(&rid).cloned()) {
                     let answer = match msg.get("error") {
                         Some(e) if !e.is_null() => Err(Failed::new(
                             e.get("message").and_then(Value::as_str).map(String::from).unwrap_or_else(|| e.to_string()),
                         )),
                         _ => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                     };
+                    let then = rid.and_then(|rid| lock(&self.then).remove(&rid));
+                    if let (Some(then), Ok(result)) = (then, &answer) {
+                        then(result);
+                    }
                     let _ = tx.send(answer);
                 }
             } else if msg.get("id").is_some() {
@@ -694,6 +766,13 @@ impl Shared {
     fn notification(&self, msg: &Value) {
         let method = msg["method"].as_str().unwrap_or_default();
         let p = &msg["params"];
+        if method.starts_with("pane.") {
+            let view = lock(&self.panes).get(&p.get("pane").map(id_text).unwrap_or_default()).cloned();
+            if let Some(view) = view {
+                view.took(method, p, true);
+            }
+            return;
+        }
         if method == "event" {
             let name = p["name"].as_str().unwrap_or_default();
             if name.starts_with(&format!("{}.", self.id)) {
@@ -741,6 +820,379 @@ impl Shared {
     }
 }
 
+// ------------------------------------------------------------------ panes
+
+/// A pane as an app sees it: its content, with every set and patch applied, and its inputs.
+pub struct PaneView {
+    shared: Arc<Shared>,
+    view: Arc<View>,
+}
+
+struct View {
+    id: String,
+    state: Mutex<ViewState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct ViewState {
+    opened: bool,
+    format: Option<String>,
+    title: Option<String>,
+    content: Value,
+    path: Option<String>,
+    closed: Option<String>,
+    frames: Vec<(String, Value)>,
+    problems: Vec<String>,
+    changes: u64,
+}
+
+impl PaneView {
+    /// Its id, as core would give it (`pane_3`).
+    pub fn id(&self) -> &str {
+        &self.view.id
+    }
+
+    /// `blocks`, `board` or `page`.
+    pub fn format(&self) -> Option<String> {
+        lock(&self.view.state).format.clone()
+    }
+
+    pub fn title(&self) -> Option<String> {
+        lock(&self.view.state).title.clone()
+    }
+
+    /// Its content now: the blocks (an array) or the board (an object); null for a page.
+    pub fn content(&self) -> Value {
+        lock(&self.view.state).content.clone()
+    }
+
+    /// A page's path.
+    pub fn path(&self) -> Option<String> {
+        lock(&self.view.state).path.clone()
+    }
+
+    /// The block with this id, anywhere in the tree.
+    pub fn block(&self, id: &str) -> Option<Value> {
+        let state = lock(&self.view.state);
+        let at = state.content.as_array().and_then(|blocks| find_block(blocks, id))?;
+        get(&state.content, &at).cloned()
+    }
+
+    /// The board's item with this id.
+    pub fn item(&self, id: &str) -> Option<Value> {
+        let state = lock(&self.view.state);
+        state.content["items"].as_array()?.iter().find(|item| item["id"] == id).cloned()
+    }
+
+    /// Why it closed, once it has.
+    pub fn closed(&self) -> Option<String> {
+        lock(&self.view.state).closed.clone()
+    }
+
+    /// What the extension sent after opening, in order: (method, params).
+    pub fn frames(&self) -> Vec<(String, Value)> {
+        lock(&self.view.state).frames.clone()
+    }
+
+    /// What the node would have refused, and why: a patch that doesn't apply, a set over 1 MiB, a
+    /// block with no id or type, or an id used twice.
+    pub fn problems(&self) -> Vec<String> {
+        lock(&self.view.state).problems.clone()
+    }
+
+    /// Send an input, as the app does (`json!({"kind": "tap", "block": "plus"})`, `{"kind": "move",
+    /// "item": …, "to": …}`), and wait for the extension's answer: its patch is applied by then. A
+    /// refusal is a [`Failed`] whose message is the extension's reason.
+    pub fn input(&self, event: Value) -> Result<(), Failed> {
+        self.shared.request("pane.input", json!({"pane": self.view.id, "event": event}), CALL_TIMEOUT).map(drop)
+    }
+
+    /// What the person is looking at changed: `pane.context`.
+    pub fn look_at(&self, context: Value) -> Result<(), Failed> {
+        self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.context",
+                                 "params": {"pane": self.view.id, "context": context}}))
+    }
+
+    /// Close it from the node's side, as core does when the app goes.
+    pub fn close(&self, reason: &str) -> Result<(), Failed> {
+        let params = json!({"pane": self.view.id, "reason": reason});
+        self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.close", "params": params}))?;
+        self.view.took("closed", &json!({"reason": reason}), false);
+        Ok(())
+    }
+
+    /// Wait until `test(view)` holds: for what a periodic task changes.
+    pub fn wait(&self, timeout: Duration, test: impl Fn(&PaneView) -> bool) -> Result<(), Failed> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let seen = lock(&self.view.state).changes;
+            if test(self) {
+                return Ok(());
+            }
+            let state = lock(&self.view.state);
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || self.shared.gone.load(Ordering::SeqCst) {
+                return Err(Failed::new(format!(
+                    "pane {} didn't get there in {:.1} s: {}",
+                    self.view.id,
+                    timeout.as_secs_f64(),
+                    state.content
+                )));
+            }
+            if state.changes == seen {
+                drop(self.view.changed.wait_timeout(state, left).unwrap_or_else(PoisonError::into_inner));
+            }
+        }
+    }
+}
+
+impl View {
+    fn took(&self, method: &str, p: &Value, record: bool) {
+        let mut state = lock(&self.state);
+        if record {
+            state.frames.push((method.to_string(), p.clone()));
+        }
+        if !state.opened && method != "opened" {
+            state.problems.push(format!("{method} before the pane was open"));
+        } else if state.closed.is_some() && method != "opened" {
+            // in flight as it closed: the node drops it
+        } else {
+            match method {
+                "opened" => {
+                    state.opened = true;
+                    state.format = p["format"].as_str().map(String::from);
+                    state.title = p["title"].as_str().map(String::from);
+                    state.path = p["path"].as_str().map(String::from);
+                    let content = content_of(&state, p);
+                    let problems = set_problems(state.format.as_deref(), &content);
+                    state.problems.extend(problems);
+                    state.content = content;
+                }
+                "pane.set" => {
+                    let content = content_of(&state, p);
+                    let problems = set_problems(state.format.as_deref(), &content);
+                    if problems.is_empty() {
+                        state.content = content;
+                    }
+                    state.problems.extend(problems);
+                }
+                "pane.patch" => match apply_patch(&state.content, &p["patch"]) {
+                    Ok(content) => {
+                        if state.format.as_deref() == Some("blocks") {
+                            let problems = block_problems(&content);
+                            state.problems.extend(problems);
+                        }
+                        state.content = content;
+                    }
+                    Err(e) => state.problems.push(format!("patch: {e}")),
+                },
+                "pane.title" => state.title = p["title"].as_str().map(String::from),
+                "pane.closed" | "closed" => {
+                    state.closed = Some(p["reason"].as_str().filter(|r| !r.is_empty()).unwrap_or("closed").to_string())
+                }
+                _ => {}
+            }
+        }
+        state.changes += 1;
+        self.changed.notify_all();
+    }
+}
+
+fn content_of(state: &ViewState, p: &Value) -> Value {
+    match state.format.as_deref() {
+        Some("blocks") => p["blocks"].clone(),
+        Some("board") => p["board"].clone(),
+        _ => Value::Null,
+    }
+}
+
+fn set_problems(format: Option<&str>, content: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    if format == Some("page") {
+        return problems;
+    }
+    let size = serde_json::to_vec(content).map(|b| b.len()).unwrap_or(0);
+    if size > FRAME_MAX {
+        problems.push(format!("a set of {size} bytes is over the 1 MiB a frame"));
+    }
+    if format == Some("blocks") {
+        problems.extend(block_problems(content));
+    } else if !content["items"].is_array() {
+        problems.push("a board is an object with items".into());
+    }
+    problems
+}
+
+/// The little a stand-in checks: each block has a type and an id, unique in the pane.
+pub fn block_problems(blocks: &Value) -> Vec<String> {
+    fn walk(items: &[Value], at: &str, seen: &mut Vec<String>, problems: &mut Vec<String>) {
+        for (i, b) in items.iter().enumerate() {
+            let here = format!("{at}[{i}]");
+            let Some(kind) = b["type"].as_str().filter(|t| !t.is_empty()) else {
+                problems.push(format!("{here} has no type"));
+                continue;
+            };
+            match b["id"].as_str().filter(|id| !id.is_empty()) {
+                None => problems.push(format!("{here} ({kind}) has no id")),
+                Some(id) if seen.iter().any(|s| s == id) => {
+                    problems.push(format!("{here}: the id '{id}' is used twice"))
+                }
+                Some(id) => seen.push(id.to_string()),
+            }
+            if let Some(children) = b["children"].as_array() {
+                walk(children, &format!("{here}.children"), seen, problems);
+            }
+            for (t, tab) in b["tabs"].as_array().into_iter().flatten().enumerate() {
+                if let Some(children) = tab["children"].as_array() {
+                    walk(children, &format!("{here}.tabs[{t}].children"), seen, problems);
+                }
+            }
+        }
+    }
+    let Some(blocks) = blocks.as_array() else { return vec!["blocks must be an array".into()] };
+    let (mut seen, mut problems) = (Vec::new(), Vec::new());
+    walk(blocks, "blocks", &mut seen, &mut problems);
+    problems
+}
+
+/// RFC 6902, as a pane's patch: the content with every operation applied, or why it can't be.
+/// Paths go through ids: `/b/<block id>/…` or `/i/<item id>/…`.
+pub fn apply_patch(content: &Value, ops: &Value) -> Result<Value, String> {
+    let mut out = content.clone();
+    for op in ops.as_array().into_iter().flatten() {
+        let path = op["path"].as_str().unwrap_or_default();
+        let from = op["from"].as_str().unwrap_or_default();
+        match op["op"].as_str().unwrap_or_default() {
+            "add" => add(&mut out, path, op["value"].clone())?,
+            "remove" => drop(remove(&mut out, path)?),
+            "replace" => {
+                remove(&mut out, path)?;
+                add(&mut out, path, op["value"].clone())?;
+            }
+            "move" => {
+                let value = remove(&mut out, from)?;
+                add(&mut out, path, value)?;
+            }
+            "copy" => {
+                let at = locate(&out, from)?;
+                let value = get(&out, &at).cloned().ok_or_else(|| nothing(from, at.last()))?;
+                add(&mut out, path, value)?;
+            }
+            "test" => {
+                let at = locate(&out, path)?;
+                if get(&out, &at) != Some(&op["value"]) {
+                    return Err(format!("'{path}': test failed"));
+                }
+            }
+            other => return Err(format!("'{other}' isn't an RFC 6902 operation")),
+        }
+    }
+    Ok(out)
+}
+
+/// A patch path as plain tokens from the content's root, through the block or item it names.
+fn locate(content: &Value, path: &str) -> Result<Vec<String>, String> {
+    let tokens: Vec<String> = match path.strip_prefix('/') {
+        Some(rest) => rest.split('/').map(|t| t.replace("~1", "/").replace("~0", "~")).collect(),
+        None => Vec::new(),
+    };
+    if tokens.len() < 2 || (tokens[0] != "b" && tokens[0] != "i") {
+        return Err(format!("'{path}': a pane's patch paths start /b/<block id> or /i/<item id>"));
+    }
+    let base = if tokens[0] == "b" {
+        content.as_array().and_then(|blocks| find_block(blocks, &tokens[1]))
+    } else {
+        content["items"]
+            .as_array()
+            .and_then(|items| items.iter().position(|item| item["id"] == tokens[1].as_str()))
+            .map(|i| vec!["items".to_string(), i.to_string()])
+    };
+    let what = if tokens[0] == "b" { "block" } else { "item" };
+    let mut at = base.ok_or_else(|| format!("'{path}': no {what} '{}'", tokens[1]))?;
+    at.extend(tokens[2..].iter().cloned());
+    Ok(at)
+}
+
+fn find_block(blocks: &[Value], id: &str) -> Option<Vec<String>> {
+    for (i, block) in blocks.iter().enumerate() {
+        if block["id"] == id {
+            return Some(vec![i.to_string()]);
+        }
+        let mut lists: Vec<(Vec<String>, &Vec<Value>)> = Vec::new();
+        if let Some(children) = block["children"].as_array() {
+            lists.push((vec![i.to_string(), "children".into()], children));
+        }
+        for (t, tab) in block["tabs"].as_array().into_iter().flatten().enumerate() {
+            if let Some(children) = tab["children"].as_array() {
+                lists.push((vec![i.to_string(), "tabs".into(), t.to_string(), "children".into()], children));
+            }
+        }
+        for (mut at, children) in lists {
+            if let Some(rest) = find_block(children, id) {
+                at.extend(rest);
+                return Some(at);
+            }
+        }
+    }
+    None
+}
+
+fn get<'a>(v: &'a Value, at: &[String]) -> Option<&'a Value> {
+    at.iter().try_fold(v, |v, token| match v {
+        Value::Object(map) => map.get(token),
+        Value::Array(items) => items.get(token.parse::<usize>().ok()?),
+        _ => None,
+    })
+}
+
+fn get_mut<'a>(v: &'a mut Value, at: &[String]) -> Option<&'a mut Value> {
+    at.iter().try_fold(v, |v, token| match v {
+        Value::Object(map) => map.get_mut(token),
+        Value::Array(items) => items.get_mut(token.parse::<usize>().ok()?),
+        _ => None,
+    })
+}
+
+fn nothing(path: &str, key: Option<&String>) -> String {
+    format!("'{path}': nothing at '{}'", key.map(String::as_str).unwrap_or_default())
+}
+
+fn add(content: &mut Value, path: &str, value: Value) -> Result<(), String> {
+    let at = locate(content, path)?;
+    let (key, parent) = at.split_last().ok_or_else(|| nothing(path, None))?;
+    let parent = get_mut(content, parent).ok_or_else(|| nothing(path, parent.last()))?;
+    match parent {
+        Value::Object(map) => {
+            map.insert(key.clone(), value);
+        }
+        Value::Array(items) if key == "-" => items.push(value),
+        Value::Array(items) => {
+            let i: usize = key.parse().map_err(|_| format!("'{path}': '{key}' isn't an index"))?;
+            if i > items.len() {
+                return Err(format!("'{path}': {i} is past the end"));
+            }
+            items.insert(i, value);
+        }
+        _ => {
+            return Err(format!("'{path}': can't add inside a {}", if parent.is_string() { "string" } else { "value" }))
+        }
+    }
+    Ok(())
+}
+
+fn remove(content: &mut Value, path: &str) -> Result<Value, String> {
+    let at = locate(content, path)?;
+    let (key, parent) = at.split_last().ok_or_else(|| nothing(path, None))?;
+    let parent = get_mut(content, parent).ok_or_else(|| nothing(path, parent.last()))?;
+    let removed = match parent {
+        Value::Object(map) => map.remove(key),
+        Value::Array(items) => key.parse::<usize>().ok().filter(|i| *i < items.len()).map(|i| items.remove(i)),
+        _ => None,
+    };
+    removed.ok_or_else(|| nothing(path, Some(key)))
+}
+
 fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
@@ -752,7 +1204,62 @@ fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::allows_secret;
+    use super::{allows_secret, apply_patch, block_problems};
+    use crate::pointer;
+    use serde_json::json;
+
+    #[test]
+    fn patches_go_through_ids() {
+        let blocks = json!([
+            {"type": "tabs", "id": "t", "tabs": [
+                {"id": "one", "title": "One", "children": [{"type": "list", "id": "a/b", "items": []}]}]},
+            {"type": "text", "id": "x", "markdown": "hi"}]);
+        let out = apply_patch(
+            &blocks,
+            &json!([
+                {"op": "add", "path": pointer(["b", "a/b", "items", "-"]), "value": {"id": "r1", "title": "Row"}},
+                {"op": "add", "path": "/b/a~1b/items/0", "value": {"id": "r0", "title": "First"}},
+                {"op": "copy", "from": "/b/x/markdown", "path": "/b/a~1b/note"},
+                {"op": "test", "path": "/b/a~1b/note", "value": "hi"},
+                {"op": "move", "from": "/b/x/markdown", "path": "/b/x/text"},
+                {"op": "remove", "path": "/b/t/tabs/0/children/0/items/1"},
+            ]),
+        )
+        .unwrap();
+        let inner = &out[0]["tabs"][0]["children"][0];
+        assert_eq!(inner["items"], json!([{"id": "r0", "title": "First"}]));
+        assert_eq!(inner["note"], "hi");
+        assert_eq!(out[1], json!({"type": "text", "id": "x", "text": "hi"}));
+        assert_eq!(apply_patch(&blocks, &json!([{"op": "remove", "path": "/b/x"}])).unwrap(), json!([blocks[0]]));
+        let board = json!({"items": [{"id": "i1", "state": "Todo"}]});
+        let moved = apply_patch(&board, &json!([{"op": "replace", "path": "/i/i1/state", "value": "Done"}])).unwrap();
+        assert_eq!(moved["items"][0]["state"], "Done");
+        for (bad, why) in [
+            (json!({"op": "replace", "path": "/0/markdown", "value": 1}), "start /b/<block id>"),
+            (json!({"op": "replace", "path": "/b/nope/x", "value": 1}), "no block 'nope'"),
+            (json!({"op": "replace", "path": "/b/x/tone", "value": 1}), "nothing at 'tone'"),
+            (json!({"op": "add", "path": "/b/a~1b/items/5", "value": 1}), "past the end"),
+            (json!({"op": "test", "path": "/b/x/markdown", "value": "no"}), "test failed"),
+            (json!({"op": "frob", "path": "/b/x"}), "isn't an RFC 6902"),
+        ] {
+            let e = apply_patch(&blocks, &json!([bad])).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
+    }
+
+    #[test]
+    fn blocks_need_a_type_and_an_id_once() {
+        let blocks = json!([{"type": "text", "id": "a"}, {"type": "stack", "id": "s", "children": [
+            {"type": "text", "id": "a"}, {"id": "n"}, {"type": "stat"}]}]);
+        assert_eq!(
+            block_problems(&blocks),
+            [
+                "blocks[1].children[0]: the id 'a' is used twice",
+                "blocks[1].children[1] has no type",
+                "blocks[1].children[2] (stat) has no id",
+            ]
+        );
+    }
 
     #[test]
     fn secrets_by_name_or_under_a_prefix() {

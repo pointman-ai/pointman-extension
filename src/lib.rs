@@ -27,6 +27,10 @@
 //! Commands in the same lane run one at a time, on the lane's own thread, with its periodic tasks
 //! between them (an app's API that must only ever be driven from one thread). A command with no
 //! lane gets a thread of its own, and so does each of the node's requests to a [`Extension::method`].
+//!
+//! Panes ([`Extension::pane`], [`Pane`]): the extension answers `pane.open` for each of its
+//! manifest's `[[panes]]` with the first content, then keeps it current; each pane's open, inputs,
+//! context and close run in order on a thread of its own.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -43,7 +47,10 @@ use anyhow::{anyhow, bail, Context as _};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+mod pane;
 pub mod testing;
+
+pub use pane::{pointer, Pane, Refused};
 
 /// The protocol version this SDK speaks.
 pub const PROTOCOL: u64 = 1;
@@ -117,6 +124,7 @@ struct Shared {
     events: Mutex<HashMap<String, Value>>,
     answers: Mutex<HashMap<String, Sender<Result<Value, String>>>>,
     calls: AtomicU64,
+    panes: Mutex<HashMap<String, Pane>>,
 }
 
 /// The extension's line to the node: events, requests, secrets, the log, the settings. Cheap to
@@ -150,6 +158,12 @@ impl Handle {
     /// `state_dir` and `roots`.
     pub fn node(&self) -> Value {
         read(&self.0.node).clone()
+    }
+
+    /// The panes open now, of one of the manifest's `[[panes]]` (every one, for `""`): for a task
+    /// that keeps them current.
+    pub fn panes(&self, open: &str) -> Vec<Pane> {
+        lock(&self.0.panes).values().filter(|p| open.is_empty() || p.open() == open).cloned().collect()
     }
 
     /// A line in the extension's log (stderr, which the node keeps). Never print to stdout: it's
@@ -346,6 +360,8 @@ pub struct Extension {
     handle: Handle,
     lanes: HashMap<String, Option<String>>,
     commands: HashMap<String, CommandFn>,
+    pane_formats: HashMap<String, Option<String>>,
+    openers: HashMap<String, pane::OpenFn>,
     methods: HashMap<String, MethodFn>,
     on_start: Vec<HookFn>,
     on_settings: Vec<HookFn>,
@@ -383,6 +399,12 @@ impl Extension {
             .flatten()
             .filter_map(|c| Some((c["kind"].as_str()?.to_string(), c["lane"].as_str().map(String::from))))
             .collect();
+        let pane_formats = manifest["panes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| Some((p["id"].as_str()?.to_string(), p["format"].as_str().map(String::from))))
+            .collect();
         let handle = Handle(Arc::new(Shared {
             id,
             version,
@@ -392,11 +414,14 @@ impl Extension {
             events: Mutex::default(),
             answers: Mutex::default(),
             calls: AtomicU64::new(0),
+            panes: Mutex::default(),
         }));
         Ok(Extension {
             handle,
             lanes,
             commands: HashMap::new(),
+            pane_formats,
+            openers: HashMap::new(),
             methods: HashMap::new(),
             on_start: Vec::new(),
             on_settings: Vec::new(),
@@ -448,6 +473,28 @@ impl Extension {
         let f: MethodFn = Arc::new(move |params| Ok(serde_json::to_value(f(params)?)?));
         self.methods.insert(name.to_string(), f);
         self
+    }
+
+    /// Open one of the manifest's `[[panes]]`: `f(pane)` returns its first content, `{"title": …,
+    /// "blocks": […]}` (or `"board": {…}`, or a page's `"path"`), and the format comes from the
+    /// manifest. An error is the node's answer, and the pane doesn't open.
+    ///
+    /// # Panics
+    /// If `id` isn't one of extension.toml's `[[panes]]`.
+    pub fn pane<F, R>(&mut self, id: &str, f: F) -> &mut Self
+    where
+        F: Fn(&Pane) -> anyhow::Result<R> + Send + Sync + 'static,
+        R: Serialize,
+    {
+        assert!(self.pane_formats.contains_key(id), "{id} isn't a pane in extension.toml");
+        let f: pane::OpenFn = Arc::new(move |pane: &Pane| Ok(serde_json::to_value(f(pane)?)?));
+        self.openers.insert(id.to_string(), f);
+        self
+    }
+
+    /// The format each of the manifest's `[[panes]]` has, by id.
+    pub fn pane_formats(&self) -> &HashMap<String, Option<String>> {
+        &self.pane_formats
     }
 
     /// Called once, after the node has said hello and given the settings.
@@ -531,6 +578,16 @@ impl Extension {
                     h.reply(rid, result);
                 }
             });
+            return true;
+        }
+        if matches!(method.as_str(), "pane.open" | "pane.input" | "pane.context" | "pane.close") {
+            let opener = match method.as_str() {
+                "pane.open" => params["open"].as_str().and_then(|open| {
+                    Some((self.openers.get(open)?.clone(), self.pane_formats.get(open).cloned().flatten()))
+                }),
+                _ => None,
+            };
+            pane::message(&self.handle, &method, &params, rid, opener);
             return true;
         }
         let result = match method.as_str() {

@@ -1,0 +1,39 @@
+# Panes from the Rust SDK (Pointman's docs/dev/panes.md): a counter of blocks, a tracker's board, a
+# clock a periodic task keeps current, and a page. For the SDK's own tests (tests/panes.rs), and to
+# start a pane from.
+[extension]
+id = "panes"
+name = "Panes"
+version = "0.1.0"
+publisher = "aurelio"
+summary = "Every kind of pane the Rust SDK opens, for its own tests."
+node = ">=0.1,<1"
+platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
+
+[run]
+command = ["bin/panes"]
+runtime = "binary"
+
+[[panes]]
+id = "counter"
+title = "Counter"
+format = "blocks"                  # or "board" or "page"
+opens = ["command"]                # what can open it: a matched link, a project item, a /command
+
+[[panes]]
+id = "board"
+title = "Spark"
+format = "board"
+opens = ["link"]
+
+[[panes]]
+id = "clock"
+title = "Clock"
+format = "blocks"
+opens = ["command"]
+
+[[panes]]
+id = "page"
+title = "Page"
+format = "page"
+opens = ["link"]

@@ -24,3 +24,7 @@ path = "examples/hello/main.rs"
 [[example]]
 name = "demo"
 path = "examples/demo/main.rs"
+
+[[example]]
+name = "panes"
+path = "examples/panes/main.rs"
