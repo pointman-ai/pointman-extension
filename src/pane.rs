@@ -201,6 +201,7 @@ impl Pane {
             Last::Unset | Last::Unknown => None,
         };
         match ops {
+            Some(ops) if ops.is_empty() => {} // only what's the person's changed (the open tab)
             Some(ops) => self.notify("pane.patch", "patch", Value::Array(ops)),
             None => self.notify("pane.set", key, new.clone()),
         }
