@@ -116,6 +116,38 @@ fn a_task_keeps_every_open_pane_current() {
     b.wait(WAIT, |v| ticks(v) >= Some(8)).unwrap();
     assert_eq!(a.frames().len(), stopped_at); // a closed pane hears nothing more
     assert!(a.title().is_none() && a.problems().is_empty() && b.problems().is_empty());
+    // show sent only what changed: each tick the count, and the log's new row
+    let frames = b.frames();
+    assert!(frames.iter().all(|(method, _)| method == "pane.patch"), "{frames:?}");
+    assert_eq!(
+        frames[1].1["patch"],
+        json!([{"op": "add", "path": "/b/ticks/value", "value": 2},
+               {"op": "add", "path": "/b/log/items/-", "value": {"id": "t2", "title": "Tick 2"}}])
+    );
+    let shown = ticks(&b).unwrap() as usize;
+    assert!(b.block("log").unwrap()["items"].as_array().unwrap().len() >= shown.min(8));
+}
+
+#[test]
+fn show_board_sends_only_the_items_that_changed() {
+    let node = panes();
+    let board = node.open_pane("board", Value::Null).unwrap();
+    board.input(json!({"kind": "move", "item": "lin_1", "to": "Done"})).unwrap();
+    board.input(json!({"kind": "edit", "item": "lin_parent", "fields": {"title": "Parent, renamed"}})).unwrap();
+    let frames = board.frames();
+    assert_eq!(frames.len(), 2);
+    // the move's patch was kept, so the edit's show sends the title alone
+    assert_eq!(
+        frames[1],
+        (
+            "pane.patch".to_string(),
+            json!({"pane": board.id(), "patch": [
+            {"op": "add", "path": "/i/lin_parent/title", "value": "Parent, renamed"}]})
+        )
+    );
+    assert_eq!(board.item("lin_parent").unwrap()["title"], "Parent, renamed");
+    assert_eq!(board.item("lin_1").unwrap()["state"], "Done");
+    assert!(board.problems().is_empty(), "{:?}", board.problems());
 }
 
 #[test]

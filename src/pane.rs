@@ -27,7 +27,9 @@
 //! # }
 //! ```
 //!
-//! Each pane's open, inputs, context and close run in order on a thread of its own.
+//! Each pane's open, inputs, context and close run in order on a thread of its own. To keep a pane
+//! current, [`Pane::show`] (or [`Pane::show_board`]) takes all of its content each time and sends only
+//! what changed, as patches by id, so the apps animate rows and numbers in place.
 
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -78,6 +80,14 @@ enum Message {
     Close(String),
 }
 
+/// What the apps have, as far as [`Pane::show`] knows: nothing sent yet, the content after what was
+/// sent, or unknown after a hand-made patch (the next show sends all of it).
+enum Last {
+    Unset,
+    Known(Value),
+    Unknown,
+}
+
 /// Whether it's closed, and what it sent before its open was answered (sent right after).
 struct Gate {
     closed: Option<String>,
@@ -91,6 +101,7 @@ struct Inner {
     viewer: Value,
     context: RwLock<Value>,
     gate: Mutex<Gate>,
+    last: Mutex<Last>,
     input: Mutex<Option<InputFn>>,
     on_context: Mutex<Vec<InputFn>>,
     on_close: Mutex<Vec<CloseFn>>,
@@ -141,6 +152,12 @@ impl Pane {
         lock(&self.0.gate).closed.clone()
     }
 
+    /// Its open is answered, and it hasn't closed.
+    pub fn is_open(&self) -> bool {
+        let gate = lock(&self.0.gate);
+        gate.held.is_none() && gate.closed.is_none()
+    }
+
     /// The extension's [`Handle`].
     pub fn handle(&self) -> &Handle {
         &self.0.handle
@@ -148,31 +165,89 @@ impl Pane {
 
     /// All of a `blocks` pane's content: blocks, version 2.
     pub fn set(&self, blocks: impl Serialize) {
-        self.notify("pane.set", "blocks", to_json(blocks));
+        let blocks = to_json(blocks);
+        let mut last = lock(&self.0.last);
+        self.notify("pane.set", "blocks", blocks.clone());
+        *last = Last::Known(blocks);
     }
 
     /// All of a `board` pane's content.
     pub fn set_board(&self, board: impl Serialize) {
-        self.notify("pane.set", "board", to_json(board));
+        let board = to_json(board);
+        let mut last = lock(&self.0.last);
+        self.notify("pane.set", "board", board.clone());
+        *last = Last::Known(board);
     }
 
-    /// RFC 6902 operations on its content. Paths go through ids, `/b/<block>/…` or `/i/<item>/…`
-    /// ([`pointer`]), so a patch still lands when a list above it grows.
+    /// All of a `blocks` pane's content, as it is now: only what changed since the last goes out, as
+    /// patches by id ([`changes`]), or all of it when the blocks themselves changed. Nothing when
+    /// nothing did.
+    pub fn show(&self, blocks: impl Serialize) {
+        self.show_as("blocks", to_json(blocks));
+    }
+
+    /// All of a `board` pane's content, as it is now: changed items go out as patches by id
+    /// ([`board_changes`]).
+    pub fn show_board(&self, board: impl Serialize) {
+        self.show_as("board", to_json(board));
+    }
+
+    fn show_as(&self, key: &str, new: Value) {
+        let mut last = lock(&self.0.last);
+        let ops = match &*last {
+            Last::Known(old) if *old == new => return,
+            Last::Known(old) if key == "board" => Some(board_changes(old, &new)),
+            Last::Known(old) => changes(old, &new),
+            Last::Unset | Last::Unknown => None,
+        };
+        match ops {
+            Some(ops) => self.notify("pane.patch", "patch", Value::Array(ops)),
+            None => self.notify("pane.set", key, new.clone()),
+        }
+        *last = Last::Known(new);
+    }
+
+    /// RFC 6902 operations on its content (add, replace and remove). Paths go through ids,
+    /// `/b/<block>/…` or `/i/<item>/…` ([`pointer`]), so a patch still lands when a list above it
+    /// grows.
     pub fn patch(&self, ops: impl Serialize) {
         let ops = to_json(ops);
         if ops.as_array().is_some_and(|ops| !ops.is_empty()) {
+            let mut last = lock(&self.0.last);
             self.notify("pane.patch", "patch", ops);
+            *last = Last::Unknown;
         }
     }
 
     /// Set some of one block's fields, there before or not: `pane.update("count", json!({"value": 3}))`.
     pub fn update(&self, block: &str, fields: Value) {
-        self.patch(set_ops("b", block, fields));
+        self.set_fields("b", block, fields);
     }
 
     /// Set some of one board item's fields: `pane.update_item("lin_9f2", json!({"state": "Done"}))`.
     pub fn update_item(&self, item: &str, fields: Value) {
-        self.patch(set_ops("i", item, fields));
+        self.set_fields("i", item, fields);
+    }
+
+    /// A patch of field sets, kept in what [`show`](Self::show) compares with, so the next show sends
+    /// only what changed after it.
+    fn set_fields(&self, kind: &str, id: &str, fields: Value) {
+        let ops = set_ops(kind, id, &fields);
+        if ops.is_empty() {
+            return;
+        }
+        let mut last = lock(&self.0.last);
+        self.notify("pane.patch", "patch", Value::Array(ops));
+        let kept = match (&mut *last, fields) {
+            (Last::Known(content), Value::Object(fields)) => {
+                let target = if kind == "b" { find_block_mut(content, id) } else { find_item_mut(content, id) };
+                target.and_then(Value::as_object_mut).map(|target| target.extend(fields)).is_some()
+            }
+            _ => false,
+        };
+        if !kept {
+            *last = Last::Unknown;
+        }
     }
 
     pub fn set_title(&self, title: &str) {
@@ -252,15 +327,43 @@ impl Pane {
     }
 }
 
-fn set_ops(kind: &str, id: &str, fields: Value) -> Value {
-    let ops: Vec<Value> = match fields {
+fn set_ops(kind: &str, id: &str, fields: &Value) -> Vec<Value> {
+    match fields {
         Value::Object(fields) => fields
-            .into_iter()
+            .iter()
             .map(|(field, value)| json!({"op": "add", "path": pointer([kind, id, field.as_str()]), "value": value}))
             .collect(),
         _ => Vec::new(),
-    };
-    Value::Array(ops)
+    }
+}
+
+/// The block with this id, anywhere in a `blocks` content (in `children` and `tabs[].children`).
+fn find_block_mut<'a>(v: &'a mut Value, id: &str) -> Option<&'a mut Value> {
+    let at = block_at(v, id, String::new())?;
+    v.pointer_mut(&at)
+}
+
+/// Where the block with this id is, as a JSON Pointer from the top of the content.
+fn block_at(v: &Value, id: &str, at: String) -> Option<String> {
+    for (i, block) in v.as_array()?.iter().enumerate() {
+        let here = format!("{at}/{i}");
+        if block["id"] == id {
+            return Some(here);
+        }
+        if let Some(found) = block_at(&block["children"], id, format!("{here}/children")) {
+            return Some(found);
+        }
+        for (t, tab) in block["tabs"].as_array().into_iter().flatten().enumerate() {
+            if let Some(found) = block_at(&tab["children"], id, format!("{here}/tabs/{t}/children")) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn find_item_mut<'a>(board: &'a mut Value, id: &str) -> Option<&'a mut Value> {
+    board.get_mut("items")?.as_array_mut()?.iter_mut().find(|item| item["id"] == id)
 }
 
 // ------------------------------------------------------------------ the node's side
@@ -297,6 +400,7 @@ pub(crate) fn message(
             viewer: field("viewer"),
             context: RwLock::new(field("context")),
             gate: Mutex::new(Gate { closed: None, held: Some(Vec::new()) }),
+            last: Mutex::new(Last::Unset),
             input: Mutex::new(None),
             on_context: Mutex::default(),
             on_close: Mutex::default(),
@@ -347,6 +451,13 @@ fn run(pane: Pane, rx: Receiver<Message>, opener: OpenFn, format: Option<String>
             return;
         }
         Ok(answer) => {
+            // what the apps have now, unless it sent more while opening (which goes after the answer)
+            let mut last = lock(&pane.0.last);
+            if matches!(*last, Last::Unset) {
+                let content = answer.get("blocks").or_else(|| answer.get("board")).cloned();
+                *last = content.map_or(Last::Unknown, Last::Known);
+            }
+            drop(last);
             // the answer first, then what it sent while opening
             let mut gate = lock(&pane.0.gate);
             if let Some(rid) = rid {
@@ -419,6 +530,106 @@ fn opened(pane: &Pane, answer: Value, format: Option<String>) -> anyhow::Result<
     Ok(Value::Object(answer))
 }
 
+/// What changed from one `blocks` content to the next, as patches by id: a block's changed fields are
+/// set, and a list that only grew gets its new entries added at the end (new comments slide in), so the
+/// apps keep their tab and their scroll. None when the blocks themselves changed (added, gone, moved
+/// or of another type): send all of it. Which tab is open is the person's, so `selected` never goes.
+pub fn changes(old: &Value, new: &Value) -> Option<Vec<Value>> {
+    let mut ops = Vec::new();
+    same_blocks(old.as_array()?, new.as_array()?, &mut ops).then_some(ops)
+}
+
+fn same_blocks(old: &[Value], new: &[Value], ops: &mut Vec<Value>) -> bool {
+    old.len() == new.len()
+        && old.iter().zip(new).all(|(a, b)| a["id"] == b["id"] && a["type"] == b["type"] && b["id"].is_string())
+        && old.iter().zip(new).all(|(a, b)| same_block(a, b, ops))
+}
+
+fn same_block(old: &Value, new: &Value, ops: &mut Vec<Value>) -> bool {
+    let (Some(a), Some(b), Some(id)) = (old.as_object(), new.as_object(), new["id"].as_str()) else { return false };
+    let none = Vec::new();
+    for key in a.keys().chain(b.keys().filter(|k| !a.contains_key(*k))) {
+        let (before, after) = (a.get(key), b.get(key));
+        if before == after || key == "selected" {
+            continue;
+        }
+        let path = pointer(["b", id, key.as_str()]);
+        match (key.as_str(), before, after) {
+            ("children", Some(Value::Array(x)), Some(Value::Array(y))) => {
+                if !same_blocks(x, y, ops) {
+                    return false;
+                }
+            }
+            ("tabs", Some(Value::Array(x)), Some(Value::Array(y))) => {
+                if x.len() != y.len() || x.iter().zip(y).any(|(s, t)| s["id"] != t["id"]) {
+                    return false;
+                }
+                for (i, (s, t)) in x.iter().zip(y).enumerate() {
+                    if s["title"] != t["title"] {
+                        let at = pointer(["b", id, "tabs", &i.to_string(), "title"]);
+                        ops.push(json!({"op": "add", "path": at, "value": t["title"]}));
+                    }
+                    let children = |tab: &Value| tab["children"].as_array().unwrap_or(&none).clone();
+                    if !same_blocks(&children(s), &children(t), ops) {
+                        return false;
+                    }
+                }
+            }
+            (_, Some(Value::Array(x)), Some(Value::Array(y))) if y.len() > x.len() && y.starts_with(x) => {
+                for item in &y[x.len()..] {
+                    ops.push(json!({"op": "add", "path": format!("{path}/-"), "value": item}));
+                }
+            }
+            (_, _, Some(value)) => ops.push(json!({"op": "add", "path": path, "value": value})),
+            (_, Some(_), None) => ops.push(json!({"op": "remove", "path": path})),
+            (_, None, None) => {}
+        }
+    }
+    true
+}
+
+/// What changed from one `board` content to the next: items by id (their changed fields set, new ones
+/// added, gone ones removed; the apps order cards by `rank`), and the rest (`project`, `states`,
+/// `groups`) whole where it changed.
+pub fn board_changes(old: &Value, new: &Value) -> Vec<Value> {
+    let mut ops = Vec::new();
+    let empty = Map::new();
+    let (a, b) = (old.as_object().unwrap_or(&empty), new.as_object().unwrap_or(&empty));
+    for key in a.keys().chain(b.keys().filter(|k| !a.contains_key(*k))).filter(|k| *k != "items") {
+        match (a.get(key), b.get(key)) {
+            (x, Some(y)) if x != Some(y) => ops.push(json!({"op": "add", "path": pointer(["board", key]), "value": y})),
+            (Some(_), None) => ops.push(json!({"op": "remove", "path": pointer(["board", key])})),
+            _ => {}
+        }
+    }
+    let items = |v: &Value| -> Vec<Value> { v["items"].as_array().cloned().unwrap_or_default() };
+    let (was, now) = (items(old), items(new));
+    let id = |item: &Value| item["id"].as_str().map(String::from);
+    for item in &was {
+        if let Some(i) = id(item).filter(|i| !now.iter().any(|n| id(n).as_deref() == Some(i))) {
+            ops.push(json!({"op": "remove", "path": pointer(["i", &i])}));
+        }
+    }
+    for item in &now {
+        let Some(i) = id(item) else { continue };
+        let Some(before) = was.iter().find(|w| id(w).as_deref() == Some(&i)) else {
+            ops.push(json!({"op": "add", "path": "/board/items/-", "value": item}));
+            continue;
+        };
+        let (x, y) = (before.as_object().unwrap_or(&empty), item.as_object().unwrap_or(&empty));
+        for key in x.keys().chain(y.keys().filter(|k| !x.contains_key(*k))) {
+            match (x.get(key), y.get(key)) {
+                (p, Some(q)) if p != Some(q) => {
+                    ops.push(json!({"op": "add", "path": pointer(["i", &i, key]), "value": q}))
+                }
+                (Some(_), None) => ops.push(json!({"op": "remove", "path": pointer(["i", &i, key])})),
+                _ => {}
+            }
+        }
+    }
+    ops
+}
+
 fn kind_of(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -442,12 +653,65 @@ mod tests {
     }
 
     #[test]
+    fn changes_go_by_id_and_lists_that_grew_get_added_to() {
+        let old = json!([
+            {"type": "heading", "id": "head", "text": "PR 42", "subtitle": "open"},
+            {"type": "tabs", "id": "tabs", "selected": "a", "tabs": [
+                {"id": "a", "title": "Conversation", "children": [
+                    {"type": "timeline", "id": "timeline", "events": [{"id": "e1"}]}]},
+                {"id": "b", "title": "Files 1", "children": [{"type": "stat", "id": "n", "value": 1, "tone": "good"}]}]}]);
+        let mut new = old.clone();
+        new[0]["subtitle"] = json!("merged");
+        new[1]["selected"] = json!("b");
+        new[1]["tabs"][0]["children"][0]["events"].as_array_mut().unwrap().push(json!({"id": "e2"}));
+        new[1]["tabs"][1]["title"] = json!("Files 2");
+        new[1]["tabs"][1]["children"][0]["value"] = json!(2);
+        new[1]["tabs"][1]["children"][0].as_object_mut().unwrap().remove("tone");
+        assert_eq!(
+            changes(&old, &new).unwrap(),
+            [
+                json!({"op": "add", "path": "/b/head/subtitle", "value": "merged"}),
+                json!({"op": "add", "path": "/b/timeline/events/-", "value": {"id": "e2"}}),
+                json!({"op": "add", "path": "/b/tabs/tabs/1/title", "value": "Files 2"}),
+                json!({"op": "remove", "path": "/b/n/tone"}),
+                json!({"op": "add", "path": "/b/n/value", "value": 2}),
+            ]
+        );
+        assert_eq!(changes(&old, &old), Some(vec![]));
+        // blocks added, gone, moved or of another type: all of it goes
+        assert_eq!(changes(&old, &json!([old[1], old[0]])), None);
+        assert_eq!(changes(&old, &json!([old[0]])), None);
+        let mut retyped = old.clone();
+        retyped[0]["type"] = json!("text");
+        assert_eq!(changes(&old, &retyped), None);
+    }
+
+    #[test]
+    fn board_changes_go_by_item() {
+        let old = json!({"project": {"key": "ALA"}, "states": [{"name": "Todo"}], "items": [
+            {"id": "a", "state": "Todo", "title": "A", "owner": "james"}, {"id": "b", "state": "Todo"}]});
+        let new = json!({"project": {"key": "ALA"}, "states": [{"name": "Todo"}, {"name": "Done"}], "items": [
+            {"id": "a", "state": "Done", "title": "A"}, {"id": "c", "state": "Todo"}]});
+        assert_eq!(
+            board_changes(&old, &new),
+            [
+                json!({"op": "add", "path": "/board/states", "value": [{"name": "Todo"}, {"name": "Done"}]}),
+                json!({"op": "remove", "path": "/i/b"}),
+                json!({"op": "remove", "path": "/i/a/owner"}),
+                json!({"op": "add", "path": "/i/a/state", "value": "Done"}),
+                json!({"op": "add", "path": "/board/items/-", "value": {"id": "c", "state": "Todo"}}),
+            ]
+        );
+        assert!(board_changes(&new, &new).is_empty());
+    }
+
+    #[test]
     fn update_sets_each_field_by_id() {
         assert_eq!(
-            set_ops("b", "count", json!({"value": 3, "tone": "good"})),
+            Value::Array(set_ops("b", "count", &json!({"value": 3, "tone": "good"}))),
             json!([{"op": "add", "path": "/b/count/tone", "value": "good"},
                    {"op": "add", "path": "/b/count/value", "value": 3}])
         );
-        assert_eq!(set_ops("i", "x", json!(null)), json!([]));
+        assert!(set_ops("i", "x", &json!(null)).is_empty());
     }
 }

@@ -56,27 +56,49 @@ fn main() -> anyhow::Result<()> {
     });
 
     ext.pane("board", |pane: &Pane| {
-        pane.on_input(|pane: &Pane, event: &Value| -> anyhow::Result<()> {
-            let kind = event["kind"].as_str().unwrap_or_default();
-            if kind != "move" {
-                bail!(Refused::new(format!("{kind} isn't something this board does")));
-            }
-            let (item, to) = (event["item"].as_str().unwrap_or_default(), event["to"].as_str().unwrap_or_default());
-            if item == "lin_parent" && to == "Done" {
-                bail!(Refused::new("Linear decides when parents close"));
-            }
-            let category = if to == "Done" { "done" } else { "started" };
-            pane.update_item(item, json!({"state": to, "category": category}));
-            Ok(())
-        });
-        Ok(json!({"title": "Spark", "board": {
+        let board = Arc::new(Mutex::new(json!({
             "project": {"key": "ALA", "title": "Spark", "leading_tool": "linear"},
             "states": [{"name": "In Progress", "category": "started"}, {"name": "Done", "category": "done"}],
             "items": [
                 {"id": "lin_1", "ref": "ALA-1", "title": "One", "state": "In Progress", "category": "started"},
-                {"id": "lin_parent", "ref": "ALA-2", "title": "Parent", "state": "In Progress", "category": "started"}]}}))
+                {"id": "lin_parent", "ref": "ALA-2", "title": "Parent", "state": "In Progress", "category": "started"}]})));
+        let now = board.clone();
+        pane.on_input(move |pane: &Pane, event: &Value| -> anyhow::Result<()> {
+            let kind = event["kind"].as_str().unwrap_or_default();
+            let item = event["item"].as_str().unwrap_or_default();
+            match kind {
+                "move" => {
+                    let to = event["to"].as_str().unwrap_or_default();
+                    if item == "lin_parent" && to == "Done" {
+                        bail!(Refused::new("Linear decides when parents close"));
+                    }
+                    let category = if to == "Done" { "done" } else { "started" };
+                    pane.update_item(item, json!({"state": to, "category": category}));
+                    let mut board = now.lock().unwrap();
+                    if let Some(it) = board["items"].as_array_mut().unwrap().iter_mut().find(|i| i["id"] == item) {
+                        it["state"] = json!(to);
+                        it["category"] = json!(category);
+                    }
+                }
+                // an edit changes the tool's copy; show_board sends only what changed
+                "edit" => {
+                    let mut board = now.lock().unwrap();
+                    if let Some(it) = board["items"].as_array_mut().unwrap().iter_mut().find(|i| i["id"] == item) {
+                        if let Some(fields) = event["fields"].as_object() {
+                            it.as_object_mut().unwrap().extend(fields.clone());
+                        }
+                    }
+                    pane.show_board(&*board);
+                }
+                _ => bail!(Refused::new(format!("{kind} isn't something this board does"))),
+            }
+            Ok(())
+        });
+        let first = board.lock().unwrap().clone();
+        Ok(json!({"title": "Spark", "board": first}))
     });
 
+    // each tick shows all of the clock; show sends only what changed: the count, and the log's new row
     let ticks: Mutex<HashMap<String, u64>> = Mutex::default();
     ext.every(
         Duration::from_millis(50),
@@ -85,13 +107,17 @@ fn main() -> anyhow::Result<()> {
             for pane in h.panes("clock") {
                 let n = ticks.entry(pane.id().to_string()).or_insert(0);
                 *n += 1;
-                pane.update("ticks", json!({"value": *n}));
+                let log: Vec<Value> =
+                    (1..=*n).map(|i| json!({"id": format!("t{i}"), "title": format!("Tick {i}")})).collect();
+                pane.show(json!([{"type": "stat", "id": "ticks", "label": "Ticks", "value": *n},
+                                 {"type": "list", "id": "log", "items": log}]));
             }
         },
         "clock",
     );
     ext.pane("clock", |_pane: &Pane| {
-        Ok(json!({"blocks": [{"type": "stat", "id": "ticks", "label": "Ticks", "value": 0}]}))
+        Ok(json!({"blocks": [{"type": "stat", "id": "ticks", "label": "Ticks", "value": 0},
+                             {"type": "list", "id": "log", "items": []}]}))
     });
 
     ext.pane("page", |_pane: &Pane| Ok(json!({"title": "A page", "path": "pages/index.html"})));

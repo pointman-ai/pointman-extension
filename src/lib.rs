@@ -50,7 +50,7 @@ use serde_json::{json, Map, Value};
 mod pane;
 pub mod testing;
 
-pub use pane::{pointer, Pane, Refused};
+pub use pane::{board_changes, changes, pointer, Pane, Refused};
 
 /// The protocol version this SDK speaks.
 pub const PROTOCOL: u64 = 1;
@@ -160,10 +160,10 @@ impl Handle {
         read(&self.0.node).clone()
     }
 
-    /// The panes open now, of one of the manifest's `[[panes]]` (every one, for `""`): for a task
-    /// that keeps them current.
+    /// The panes open now, of one of the manifest's `[[panes]]` (every one, for `""`), once their open
+    /// is answered: for a task that keeps them current.
     pub fn panes(&self, open: &str) -> Vec<Pane> {
-        lock(&self.0.panes).values().filter(|p| open.is_empty() || p.open() == open).cloned().collect()
+        lock(&self.0.panes).values().filter(|p| (open.is_empty() || p.open() == open) && p.is_open()).cloned().collect()
     }
 
     /// A line in the extension's log (stderr, which the node keeps). Never print to stdout: it's

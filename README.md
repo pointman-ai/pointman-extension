@@ -78,11 +78,16 @@ ext.pane("view", |pane: &Pane| {
     pane.on_close(|pane: &Pane, reason: &str| { /* stop what feeds it */ });
     Ok(json!({"title": "PR 42", "blocks": [/* blocks v2 */]})) // or "board": {…}, or a page's "path"
 });
-// later, from anywhere: pane.set(blocks), pane.set_board(board), pane.patch(ops), pane.update_item(id,
-// fields), pane.set_title(t), pane.close(reason); h.panes("view") lists the open ones
+// later, from anywhere: pane.show(blocks) or pane.show_board(board) sends what changed since the last,
+// as patches by id (or all of it when the blocks themselves changed); also pane.set(blocks),
+// pane.set_board(board), pane.patch(ops), pane.update_item(id, fields), pane.set_title(t),
+// pane.close(reason); h.panes("view") lists the open ones
 ```
 
-The format comes from the manifest. Each pane's open, inputs, context and close run in order on a
+The format comes from the manifest. To keep a pane current, build all of its content each time and
+`show` it: rows a list gained are added at the end, changed fields set, and an item a board lost
+removed, so the apps animate in place and keep their tab and scroll (`changes` and `board_changes`
+are the diffs, if you'd rather send them yourself). Each pane's open, inputs, context and close run in order on a
 thread of its own, and what it sends while opening goes after the open's answer. Patch paths go
 through ids, `/b/<block>/…` and `/i/<item>/…` (`pointer(["b", id, field])` escapes them).
 examples/panes has one of each kind.
