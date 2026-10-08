@@ -1056,36 +1056,27 @@ pub fn block_problems(blocks: &Value) -> Vec<String> {
     problems
 }
 
-/// RFC 6902, as a pane's patch: the content with every operation applied, or why it can't be.
-/// Paths go through ids: `/b/<block id>/…` or `/i/<item id>/…`.
+/// A pane's patch, as the node applies it: RFC 6902's add, replace and remove (a patch with any other
+/// op is dropped whole). The content with every operation applied, or why it can't be. Paths go
+/// through ids, `/b/<block id>/…` or `/i/<item id>/…`, and `/b/<id>` alone is the block itself:
+/// replace swaps it, remove takes it out, add puts one before it.
 pub fn apply_patch(content: &Value, ops: &Value) -> Result<Value, String> {
     let mut out = content.clone();
     for op in ops.as_array().into_iter().flatten() {
         let path = op["path"].as_str().unwrap_or_default();
-        let from = op["from"].as_str().unwrap_or_default();
         match op["op"].as_str().unwrap_or_default() {
             "add" => add(&mut out, path, op["value"].clone())?,
             "remove" => drop(remove(&mut out, path)?),
             "replace" => {
-                remove(&mut out, path)?;
-                add(&mut out, path, op["value"].clone())?;
-            }
-            "move" => {
-                let value = remove(&mut out, from)?;
-                add(&mut out, path, value)?;
-            }
-            "copy" => {
-                let at = locate(&out, from)?;
-                let value = get(&out, &at).cloned().ok_or_else(|| nothing(from, at.last()))?;
-                add(&mut out, path, value)?;
-            }
-            "test" => {
                 let at = locate(&out, path)?;
-                if get(&out, &at) != Some(&op["value"]) {
-                    return Err(format!("'{path}': test failed"));
-                }
+                let there = get_mut(&mut out, &at).ok_or_else(|| nothing(path, at.last()))?;
+                *there = op["value"].clone();
             }
-            other => return Err(format!("'{other}' isn't an RFC 6902 operation")),
+            other => {
+                return Err(format!(
+                    "'{other}' isn't one of add, replace and remove, which is all a pane's patch takes"
+                ))
+            }
         }
     }
     Ok(out)
@@ -1213,7 +1204,7 @@ fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
 mod tests {
     use super::{allows_secret, apply_patch, block_problems};
     use crate::pointer;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn patches_go_through_ids() {
@@ -1226,9 +1217,8 @@ mod tests {
             &json!([
                 {"op": "add", "path": pointer(["b", "a/b", "items", "-"]), "value": {"id": "r1", "title": "Row"}},
                 {"op": "add", "path": "/b/a~1b/items/0", "value": {"id": "r0", "title": "First"}},
-                {"op": "copy", "from": "/b/x/markdown", "path": "/b/a~1b/note"},
-                {"op": "test", "path": "/b/a~1b/note", "value": "hi"},
-                {"op": "move", "from": "/b/x/markdown", "path": "/b/x/text"},
+                {"op": "add", "path": "/b/a~1b/note", "value": "hi"},
+                {"op": "replace", "path": "/b/x/markdown", "value": "bye"},
                 {"op": "remove", "path": "/b/t/tabs/0/children/0/items/1"},
             ]),
         )
@@ -1236,8 +1226,16 @@ mod tests {
         let inner = &out[0]["tabs"][0]["children"][0];
         assert_eq!(inner["items"], json!([{"id": "r0", "title": "First"}]));
         assert_eq!(inner["note"], "hi");
-        assert_eq!(out[1], json!({"type": "text", "id": "x", "text": "hi"}));
+        assert_eq!(out[1], json!({"type": "text", "id": "x", "markdown": "bye"}));
+        // /b/<id> alone is the block: remove takes it out, replace swaps it, add puts one before it
         assert_eq!(apply_patch(&blocks, &json!([{"op": "remove", "path": "/b/x"}])).unwrap(), json!([blocks[0]]));
+        let swapped =
+            apply_patch(&blocks, &json!([{"op": "replace", "path": "/b/x", "value": {"type": "text", "id": "z"}}]));
+        assert_eq!(swapped.unwrap()[1]["id"], "z");
+        let before =
+            apply_patch(&blocks, &json!([{"op": "add", "path": "/b/x", "value": {"type": "text", "id": "w"}}]));
+        let ids: Vec<Value> = before.unwrap().as_array().unwrap().iter().map(|b| b["id"].clone()).collect();
+        assert_eq!(ids, [json!("t"), json!("w"), json!("x")]);
         let board = json!({"items": [{"id": "i1", "state": "Todo"}]});
         let moved = apply_patch(&board, &json!([{"op": "replace", "path": "/i/i1/state", "value": "Done"}])).unwrap();
         assert_eq!(moved["items"][0]["state"], "Done");
@@ -1254,8 +1252,8 @@ mod tests {
             (json!({"op": "replace", "path": "/b/nope/x", "value": 1}), "no block 'nope'"),
             (json!({"op": "replace", "path": "/b/x/tone", "value": 1}), "nothing at 'tone'"),
             (json!({"op": "add", "path": "/b/a~1b/items/5", "value": 1}), "past the end"),
-            (json!({"op": "test", "path": "/b/x/markdown", "value": "no"}), "test failed"),
-            (json!({"op": "frob", "path": "/b/x"}), "isn't an RFC 6902"),
+            (json!({"op": "move", "from": "/b/x/markdown", "path": "/b/x/text"}), "isn't one of add"),
+            (json!({"op": "test", "path": "/b/x/markdown", "value": "hi"}), "isn't one of add"),
         ] {
             let e = apply_patch(&blocks, &json!([bad])).unwrap_err();
             assert!(e.contains(why), "{e}");
