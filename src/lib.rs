@@ -30,7 +30,8 @@
 //!
 //! Panes ([`Extension::pane`], [`Pane`]): the extension answers `pane.open` for each of its
 //! manifest's `[[panes]]` with the first content, then keeps it current; each pane's open, inputs,
-//! context and close run in order on a thread of its own.
+//! context and close run in order on a thread of its own. A `video` pane sends frames instead
+//! ([`Pane::frame`]), while the node says someone's watching ([`Pane::on_viewers`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -50,7 +51,7 @@ use serde_json::{json, Map, Value};
 mod pane;
 pub mod testing;
 
-pub use pane::{board_changes, changes, pointer, Pane, Refused};
+pub use pane::{board_changes, changes, pointer, Pane, Refused, VIDEO_FRAME_MAX};
 
 /// The protocol version this SDK speaks.
 pub const PROTOCOL: u64 = 1;
@@ -580,7 +581,7 @@ impl Extension {
             });
             return true;
         }
-        if matches!(method.as_str(), "pane.open" | "pane.input" | "pane.context" | "pane.close") {
+        if matches!(method.as_str(), "pane.open" | "pane.input" | "pane.context" | "pane.viewers" | "pane.close") {
             let opener = match method.as_str() {
                 "pane.open" => params["open"].as_str().and_then(|open| {
                     Some((self.openers.get(open)?.clone(), self.pane_formats.get(open).cloned().flatten()))
@@ -867,6 +868,23 @@ pub(crate) fn to_json(value: impl Serialize) -> Value {
     serde_json::to_value(value).unwrap_or_else(|e| Value::String(format!("<not JSON: {e}>")))
 }
 
+/// Standard base64, padded: a video frame's JPEG in `pane.frame`.
+pub(crate) fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 fn clip(text: &str, max: usize) -> &str {
     match text.char_indices().nth(max) {
         Some((i, _)) => &text[..i],
@@ -1039,6 +1057,20 @@ kind = "unit.b"
         assert_eq!(text_or(&anyhow::Error::from(Retry::new("")), "try again later"), "try again later");
         let panicked = guarded::<()>(|| panic!("boom")).unwrap_err();
         assert_eq!(panicked.to_string(), "panicked: boom");
+    }
+
+    #[test]
+    fn base64_is_the_standard_alphabet_padded() {
+        for (bytes, text) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foobar", "Zm9vYmFy"),
+            (&[0xff, 0xd8, 0xff, 0xfe][..], "/9j//g=="),
+        ] {
+            assert_eq!(base64(bytes), text);
+        }
     }
 
     /// Only that these compile: progress with or without a fraction and a stage.

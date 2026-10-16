@@ -30,8 +30,15 @@
 //! Each pane's open, inputs, context and close run in order on a thread of its own. To keep a pane
 //! current, [`Pane::show`] (or [`Pane::show_board`]) takes all of its content each time and sends only
 //! what changed, as patches by id, so the apps animate rows and numbers in place.
+//!
+//! A `video` pane (Pointman's docs/dev/video.md) opens with `{"title": …, "video": {codec, width,
+//! height, fps}}` and then sends frames, [`Pane::frame`], which the node seals and sends straight to
+//! the app. [`Pane::on_viewers`] hears how many of the app's paths are attached, so a camera runs
+//! only while someone's watching, and the app's hints (`{kind: "hint", max_fps, max_width}`, where
+//! `max_fps: 0` pauses) come as inputs.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -39,7 +46,14 @@ use anyhow::bail;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::{caused_by, guarded, id_text, lock, read, spawn, text_or, to_json, write, Handle, Outcome};
+use crate::{base64, caused_by, guarded, id_text, lock, read, spawn, text_or, to_json, write, Handle, Outcome};
+
+/// The most a video frame may be once the node has sealed it (docs/dev/video.md): the node drops a
+/// bigger one, so [`Pane::frame`] doesn't send it.
+pub const VIDEO_FRAME_MAX: usize = 4 << 20;
+/// What sealing adds to a frame's JPEG: the 20-byte header (captured_ms, seq, width, height) and the
+/// 16-byte tag.
+const SEALING: usize = 20 + 16;
 
 /// Turn down a pane's input: the app undoes what it showed early (a card snaps back) and shows
 /// why. `return Err(Refused::new("Linear decides when parents close").into())`.
@@ -73,10 +87,12 @@ where
 pub(crate) type OpenFn = Arc<dyn Fn(&Pane) -> anyhow::Result<Value> + Send + Sync>;
 type InputFn = Arc<dyn Fn(&Pane, &Value) -> anyhow::Result<()> + Send + Sync>;
 type CloseFn = Arc<dyn Fn(&Pane, &str) -> anyhow::Result<()> + Send + Sync>;
+type ViewersFn = Arc<dyn Fn(&Pane, u64) -> anyhow::Result<()> + Send + Sync>;
 
 enum Message {
     Input(Value, Option<Value>),
     Context(Value),
+    Viewers(u64),
     Close(String),
 }
 
@@ -105,6 +121,9 @@ struct Inner {
     input: Mutex<Option<InputFn>>,
     on_context: Mutex<Vec<InputFn>>,
     on_close: Mutex<Vec<CloseFn>>,
+    on_viewers: Mutex<Vec<ViewersFn>>,
+    viewers: AtomicU64,
+    too_big: AtomicBool,
     queue: Mutex<Option<Sender<Message>>>,
     handle: Handle,
 }
@@ -284,6 +303,47 @@ impl Pane {
         self
     }
 
+    /// `f(pane, attached)` when the number of the app's paths attached to a `video` pane changes:
+    /// start capturing when it's above 0, and stop at 0, so a camera's light is off when no one is
+    /// watching.
+    pub fn on_viewers<F, R>(&self, f: F) -> &Self
+    where
+        F: Fn(&Pane, u64) -> R + Send + Sync + 'static,
+        R: Outcome,
+    {
+        lock(&self.0.on_viewers).push(Arc::new(move |pane: &Pane, attached: u64| f(pane, attached).into_result()));
+        self
+    }
+
+    /// How many of the app's paths are attached to a `video` pane now, as the node last said.
+    pub fn viewers(&self) -> u64 {
+        self.0.viewers.load(Ordering::SeqCst)
+    }
+
+    /// One frame of a `video` pane: a whole JPEG, `width` by `height`, captured at `captured_ms`
+    /// (Unix time in ms). Lossy and newest-wins, so it's never held: one sent before the pane's open
+    /// is answered, after it's closed, or too big once sealed ([`VIDEO_FRAME_MAX`]: logged once) is
+    /// dropped, and false says so.
+    pub fn frame(&self, jpeg: &[u8], width: u16, height: u16, captured_ms: u64) -> bool {
+        if jpeg.len() + SEALING > VIDEO_FRAME_MAX {
+            if !self.0.too_big.swap(true, Ordering::SeqCst) {
+                let size = jpeg.len();
+                self.0
+                    .handle
+                    .log(format!("pane {}: a frame of {size} bytes is over the 4 MiB a frame: dropped", self.0.id));
+            }
+            return false;
+        }
+        let params = json!({"pane": self.0.id, "captured_ms": captured_ms, "width": width, "height": height,
+                            "jpeg": base64(jpeg)});
+        let gate = lock(&self.0.gate);
+        if gate.closed.is_some() || gate.held.is_some() {
+            return false;
+        }
+        self.0.handle.send(&json!({"jsonrpc": "2.0", "method": "pane.frame", "params": params}));
+        true
+    }
+
     /// `f(pane, reason)` once it's closed, by either side: stop what feeds it.
     pub fn on_close<F, R>(&self, f: F) -> &Self
     where
@@ -405,6 +465,9 @@ pub(crate) fn message(
             input: Mutex::new(None),
             on_context: Mutex::default(),
             on_close: Mutex::default(),
+            on_viewers: Mutex::default(),
+            viewers: AtomicU64::new(0),
+            too_big: AtomicBool::new(false),
             queue: Mutex::new(Some(tx)),
             handle: h.clone(),
         }));
@@ -429,6 +492,13 @@ pub(crate) fn message(
             let context = p.get("context").filter(|c| !c.is_null()).cloned().unwrap_or_else(|| json!({}));
             if let Some(tx) = lock(&pane.0.queue).as_ref() {
                 let _ = tx.send(Message::Context(context));
+            }
+        }
+        "pane.viewers" => {
+            let attached = p["attached"].as_u64().unwrap_or(0);
+            pane.0.viewers.store(attached, Ordering::SeqCst);
+            if let Some(tx) = lock(&pane.0.queue).as_ref() {
+                let _ = tx.send(Message::Viewers(attached));
             }
         }
         _ => {
@@ -489,6 +559,14 @@ fn run(pane: Pane, rx: Receiver<Message>, opener: OpenFn, format: Option<String>
                     }
                 }
             }
+            Message::Viewers(attached) => {
+                let handlers = lock(&pane.0.on_viewers).clone();
+                for f in handlers {
+                    if let Err(e) = guarded(|| f(&pane, attached)) {
+                        h.log(format!("pane {} on_viewers: {e:?}", pane.0.id));
+                    }
+                }
+            }
             Message::Input(event, rid) => {
                 let f = lock(&pane.0.input).clone();
                 let outcome = match f {
@@ -523,7 +601,8 @@ fn opened(pane: &Pane, answer: Value, format: Option<String>) -> anyhow::Result<
         "blocks" => ("blocks", Value::is_array, "an array"),
         "board" => ("board", Value::is_object, "an object"),
         "page" => ("path", Value::is_string, "a string"),
-        _ => bail!("the {} pane has no format (blocks, board or page) in extension.toml", pane.0.open),
+        "video" => ("video", is_video, "an object with its codec, width, height and fps"),
+        _ => bail!("the {} pane has no format (blocks, board, page or video) in extension.toml", pane.0.open),
     };
     if !answer.get(key).is_some_and(ok) {
         bail!("a {format} pane opens with its {key}, {what}");
@@ -629,6 +708,11 @@ pub fn board_changes(old: &Value, new: &Value) -> Vec<Value> {
         }
     }
     ops
+}
+
+/// What a `video` pane opens with: `{codec, width, height, fps}`.
+fn is_video(v: &Value) -> bool {
+    v["codec"].is_string() && ["width", "height", "fps"].iter().all(|k| v[*k].is_number())
 }
 
 fn kind_of(v: &Value) -> &'static str {

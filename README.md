@@ -92,6 +92,29 @@ thread of its own, and what it sends while opening goes after the open's answer.
 through ids, `/b/<block>/…` and `/i/<item>/…` (`pointer(["b", id, field])` escapes them).
 examples/panes has one of each kind.
 
+### Video panes
+
+A `video` pane (Pointman's docs/dev/video.md) is live frames from the node to the app that opened it,
+sealed by the node and sent on a direct path only. It opens with its codec, size and rate, then sends
+whole JPEGs while the node says a path is attached:
+
+```rust
+ext.pane("live", |pane: &Pane| {
+    pane.on_viewers(|pane: &Pane, attached: u64| { /* start capturing above 0, stop at 0 */ });
+    pane.on_input(|pane: &Pane, event: &Value| -> anyhow::Result<()> {
+        // the app's hint: {"kind": "hint", "max_fps": 15, "max_width": 1280}; max_fps 0 pauses
+        Ok(())
+    });
+    pane.on_close(|pane: &Pane, reason: &str| { /* stop capturing */ });
+    Ok(json!({"title": "Camera", "video": {"codec": "mjpeg", "width": 1280, "height": 720, "fps": 15}}))
+});
+// from the capture thread: pane.frame(&jpeg, width, height, captured_ms), the newest each time
+```
+
+Frames are lossy and newest-wins: one sent before the open is answered, after the pane closes, or
+over 4 MiB once sealed (`VIDEO_FRAME_MAX`, logged once) is dropped, and `frame` says false.
+`pane.viewers()` is the node's last count. examples/video is one.
+
 ## Testing
 
 `pointman_extension::testing::StandIn` starts the extension as a node does (its `[run]` command,
@@ -116,17 +139,20 @@ let view = node.open_pane("view", json!({"url": "…"}))?; // also open_pane_wit
 view.input(json!({"kind": "tap", "block": "merge"}))?;   // Err(Failed) with its reason if refused
 view.block("status");                                    // content, item, title, format, path, closed
 view.look_at(json!({"thread": "thr_1"}))?; view.close("closed")?; // wait(timeout, test), frames, problems
+let live = node.open_pane("live", json!({}))?;           // a video pane: live.video() is what it opened with
+live.viewers(1)?; live.hint(15, 1280)?;                  // a path attached; the app's hint
+live.wait(timeout, |v| v.frame_count() >= 3)?;           // video_frames(): the newest, JPEGs decoded
 ```
 
 A pane's view keeps its content as an app would, with every set and patch applied; `problems()`
 lists what the node would refuse (a patch that doesn't apply, a set over 1 MiB, a block with no id
-or type, or an id used twice).
+or type, or an id used twice; a video frame that isn't a whole JPEG or is over 4 MiB sealed).
 
 A failure is a `testing::Failed { message, retry, cancelled }`, whose Display is the extension's own
 message.
 
 This crate's own tests: `cargo test`. They run `examples/hello` (the Rust twin of the Python
-template's `hello.greet`), `examples/demo` (every part of the API) and `examples/panes` under `StandIn`, and drive the
+template's `hello.greet`), `examples/demo` (every part of the API), `examples/panes` and `examples/video` under `StandIn`, and drive the
 demo line by line to check the wire format. `tests/python.rs` also runs both under core's Python node
 (`ExtensionHost` and its stand-in), and core's Python template under `StandIn`, when
 `POINTMAN_CORE` points at a checkout of Pointman's core (`POINTMAN_CORE_PYTHON`: a Python with its

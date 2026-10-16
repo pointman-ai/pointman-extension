@@ -24,9 +24,12 @@
 //!
 //! Panes open as the node opens them, and keep their content as an app would, with each set and
 //! patch applied ([`StandIn::open_pane`], [`PaneView`]). It checks blocks only for an id each,
-//! unique in the pane, and a type; the node checks them fully.
+//! unique in the pane, and a type; the node checks them fully. A `video` pane's view says how many
+//! paths are attached ([`PaneView::viewers`]), sends the app's hints ([`PaneView::hint`]) and keeps
+//! the newest frames it was sent ([`PaneView::video_frames`]), each checked as a whole JPEG under
+//! the node's 4 MiB.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -41,13 +44,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::{guarded, id_text, load_manifest, lock, resolve, PROTOCOL};
+use crate::{guarded, id_text, load_manifest, lock, resolve, PROTOCOL, VIDEO_FRAME_MAX};
 
 /// What a stand-in passes on from its own environment, as a node does: never the board's tokens.
 pub const ENV_KEEP: [&str; 7] = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "PYTHONUTF8"];
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// A pane's frame, as the stream's limit: 1 MiB.
 pub const FRAME_MAX: usize = 1 << 20;
+/// How many of a video pane's newest frames a [`PaneView`] keeps.
+pub const VIDEO_FRAMES_KEPT: usize = 32;
 
 type MethodFn = Arc<dyn Fn(Value) -> anyhow::Result<Value> + Send + Sync>;
 type ThenFn = Box<dyn FnOnce(&Value) + Send>;
@@ -117,6 +122,15 @@ impl Default for RunOptions {
     fn default() -> Self {
         RunOptions { timeout: CALL_TIMEOUT, cid: None, checkpoint: None }
     }
+}
+
+/// One frame a `video` pane sent (`pane.frame`), its JPEG decoded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoFrame {
+    pub captured_ms: u64,
+    pub width: u16,
+    pub height: u16,
+    pub jpeg: Vec<u8>,
 }
 
 /// How to open one pane: `PaneOptions { context: json!({"thread": "thr_1"}), ..Default::default() }`.
@@ -845,6 +859,9 @@ struct ViewState {
     frames: Vec<(String, Value)>,
     problems: Vec<String>,
     changes: u64,
+    video: Value,
+    video_frames: VecDeque<VideoFrame>,
+    frame_count: u64,
 }
 
 impl PaneView {
@@ -853,7 +870,7 @@ impl PaneView {
         &self.view.id
     }
 
-    /// `blocks`, `board` or `page`.
+    /// `blocks`, `board`, `page` or `video`.
     pub fn format(&self) -> Option<String> {
         lock(&self.view.state).format.clone()
     }
@@ -870,6 +887,21 @@ impl PaneView {
     /// A page's path.
     pub fn path(&self) -> Option<String> {
         lock(&self.view.state).path.clone()
+    }
+
+    /// What a `video` pane opened with: `{codec, width, height, fps}`.
+    pub fn video(&self) -> Value {
+        lock(&self.view.state).video.clone()
+    }
+
+    /// The newest frames a `video` pane sent (at most [`VIDEO_FRAMES_KEPT`]), oldest first.
+    pub fn video_frames(&self) -> Vec<VideoFrame> {
+        lock(&self.view.state).video_frames.iter().cloned().collect()
+    }
+
+    /// How many frames a `video` pane has sent in all.
+    pub fn frame_count(&self) -> u64 {
+        lock(&self.view.state).frame_count
     }
 
     /// The block with this id, anywhere in the tree.
@@ -890,13 +922,15 @@ impl PaneView {
         lock(&self.view.state).closed.clone()
     }
 
-    /// What the extension sent after opening, in order: (method, params).
+    /// What the extension sent after opening, in order: (method, params). A video pane's frames
+    /// aren't here: [`video_frames`](Self::video_frames) has them.
     pub fn frames(&self) -> Vec<(String, Value)> {
         lock(&self.view.state).frames.clone()
     }
 
     /// What the node would have refused, and why: a patch that doesn't apply, a set over 1 MiB, a
-    /// block with no id or type, or an id used twice.
+    /// block with no id or type, or an id used twice; a video frame that isn't a whole JPEG, has no
+    /// size, or is over 4 MiB sealed, or a frame or a set on the wrong kind of pane.
     pub fn problems(&self) -> Vec<String> {
         lock(&self.view.state).problems.clone()
     }
@@ -906,6 +940,22 @@ impl PaneView {
     /// refusal is a [`Failed`] whose message is the extension's reason.
     pub fn input(&self, event: Value) -> Result<(), Failed> {
         self.shared.request("pane.input", json!({"pane": self.view.id, "event": event}), CALL_TIMEOUT).map(drop)
+    }
+
+    /// How many of the app's paths are attached to a `video` pane now, as the node says when one
+    /// attaches or drops: `pane.viewers`.
+    pub fn viewers(&self, attached: u64) -> Result<(), Failed> {
+        self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.viewers",
+                                 "params": {"pane": self.view.id, "attached": attached}}))
+    }
+
+    /// The app's hint for a `video` pane, as the node passes it on (`pane.input` of kind `hint`):
+    /// at most this many frames a second (0 pauses it) and this wide. Waits for the answer.
+    pub fn hint(&self, max_fps: u64, max_width: u64) -> Result<(), Failed> {
+        let seq = self.shared.ids.fetch_add(1, Ordering::SeqCst) + 1;
+        let event = json!({"kind": "hint", "max_fps": max_fps, "max_width": max_width});
+        let params = json!({"pane": self.view.id, "seq": seq, "event": event});
+        self.shared.request("pane.input", params, CALL_TIMEOUT).map(drop)
     }
 
     /// What the person is looking at changed: `pane.context`.
@@ -950,6 +1000,25 @@ impl PaneView {
 impl View {
     fn took(&self, method: &str, p: &Value, record: bool) {
         let mut state = lock(&self.state);
+        if method == "pane.frame" {
+            if !state.opened {
+                state.problems.push("pane.frame before the pane was open".into());
+            } else if state.closed.is_none() {
+                match video_frame(state.format.as_deref(), p) {
+                    Ok(frame) => {
+                        state.frame_count += 1;
+                        if state.video_frames.len() == VIDEO_FRAMES_KEPT {
+                            state.video_frames.pop_front();
+                        }
+                        state.video_frames.push_back(frame);
+                    }
+                    Err(problem) => state.problems.push(problem),
+                }
+            }
+            state.changes += 1;
+            self.changed.notify_all();
+            return;
+        }
         if record {
             state.frames.push((method.to_string(), p.clone()));
         }
@@ -964,10 +1033,14 @@ impl View {
                     state.format = p["format"].as_str().map(String::from);
                     state.title = p["title"].as_str().map(String::from);
                     state.path = p["path"].as_str().map(String::from);
+                    state.video = p["video"].clone();
                     let content = content_of(&state, p);
                     let problems = set_problems(state.format.as_deref(), &content);
                     state.problems.extend(problems);
                     state.content = content;
+                }
+                "pane.set" | "pane.patch" if state.format.as_deref() == Some("video") => {
+                    state.problems.push(format!("{method} on a video pane, which has frames, not content"))
                 }
                 "pane.set" => {
                     let content = content_of(&state, p);
@@ -1009,9 +1082,60 @@ fn content_of(state: &ViewState, p: &Value) -> Value {
     }
 }
 
+/// A `pane.frame` as the node takes it, or why it would drop it.
+fn video_frame(format: Option<&str>, p: &Value) -> Result<VideoFrame, String> {
+    if format != Some("video") {
+        return Err(format!("pane.frame on a {} pane: only a video pane has frames", format.unwrap_or("formatless")));
+    }
+    let jpeg = p["jpeg"].as_str().and_then(unbase64).ok_or("pane.frame: its jpeg isn't base64")?;
+    if !(jpeg.starts_with(&[0xff, 0xd8]) && jpeg.ends_with(&[0xff, 0xd9])) {
+        return Err(format!("pane.frame: {} bytes that aren't a whole JPEG (FF D8 … FF D9)", jpeg.len()));
+    }
+    if jpeg.len() + 36 > VIDEO_FRAME_MAX {
+        return Err(format!("pane.frame: {} bytes is over the 4 MiB a frame, sealed", jpeg.len()));
+    }
+    let size = |key: &str| p[key].as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0);
+    let (Some(width), Some(height)) = (size("width"), size("height")) else {
+        return Err(format!("pane.frame: its size {}x{} isn't 1 to 65535 each way", p["width"], p["height"]));
+    };
+    let captured_ms = p["captured_ms"].as_u64().ok_or("pane.frame has no captured_ms")?;
+    Ok(VideoFrame { captured_ms, width, height, jpeg })
+}
+
+/// Standard base64, padded, as a frame's `jpeg` is; None if it isn't.
+fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (i, chunk) in bytes.chunks(4).enumerate() {
+        let last = i + 1 == bytes.len() / 4;
+        let pad = chunk.iter().rev().take_while(|c| **c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for c in &chunk[..4 - pad] {
+            n = n << 6 | u32::from(value(*c)?);
+        }
+        n <<= 6 * pad;
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Some(out)
+}
+
 fn set_problems(format: Option<&str>, content: &Value) -> Vec<String> {
     let mut problems = Vec::new();
-    if format == Some("page") {
+    if matches!(format, Some("page" | "video")) {
         return problems;
     }
     let size = serde_json::to_vec(content).map(|b| b.len()).unwrap_or(0);
@@ -1242,7 +1366,7 @@ fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allows_secret, apply_patch, block_problems, board_problems};
+    use super::{allows_secret, apply_patch, block_problems, board_problems, unbase64, video_frame, VideoFrame};
     use crate::pointer;
     use serde_json::{json, Value};
 
@@ -1325,6 +1449,39 @@ mod tests {
                 "blocks[1].children[2] (stat) has no id",
             ]
         );
+    }
+
+    #[test]
+    fn unbase64_undoes_base64() {
+        for bytes in [&b""[..], b"f", b"fo", b"foo", b"foob", &[0xff, 0xd8, 0x00, 0xff, 0xd9][..]] {
+            assert_eq!(unbase64(&crate::base64(bytes)).as_deref(), Some(bytes));
+        }
+        for bad in ["Zg=", "Z===", "Zg==Zg==", "Zm9*"] {
+            assert_eq!(unbase64(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_video_frame_is_a_whole_jpeg_with_a_size_under_4_mib() {
+        let jpeg = [0xff, 0xd8, 1, 2, 0xff, 0xd9];
+        let frame = |jpeg: &[u8], width: Value| json!({"pane": "pane_1", "captured_ms": 5, "width": width, "height": 48, "jpeg": crate::base64(jpeg)});
+        assert_eq!(
+            video_frame(Some("video"), &frame(&jpeg, json!(64))),
+            Ok(VideoFrame { captured_ms: 5, width: 64, height: 48, jpeg: jpeg.to_vec() })
+        );
+        let big = [&[0xff, 0xd8][..], &vec![0; crate::VIDEO_FRAME_MAX], &[0xff, 0xd9]].concat();
+        for (format, p, why) in [
+            (Some("blocks"), frame(&jpeg, json!(64)), "only a video pane has frames"),
+            (Some("video"), frame(&jpeg[..4], json!(64)), "aren't a whole JPEG"),
+            (Some("video"), frame(&jpeg, json!(0)), "isn't 1 to 65535"),
+            (Some("video"), frame(&jpeg, json!(70000)), "isn't 1 to 65535"),
+            (Some("video"), frame(&big, json!(64)), "over the 4 MiB"),
+            (Some("video"), json!({"width": 1, "height": 1, "jpeg": "not base64"}), "isn't base64"),
+            (Some("video"), json!({"width": 1, "height": 1, "jpeg": crate::base64(&jpeg)}), "no captured_ms"),
+        ] {
+            let e = video_frame(format, &p).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
     }
 
     #[test]

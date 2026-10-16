@@ -28,3 +28,7 @@ path = "examples/demo/main.rs"
 [[example]]
 name = "panes"
 path = "examples/panes/main.rs"
+
+[[example]]
+name = "video"
+path = "examples/video/main.rs"
