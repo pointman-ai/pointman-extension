@@ -119,3 +119,49 @@ fn a_video_pane_must_open_with_its_video() {
     let e = node.open_pane("live", json!({"bad": true})).err().unwrap();
     assert!(e.message.contains("a video pane opens with its video"), "{}", e.message);
 }
+
+#[test]
+fn sound_comes_while_watched_with_the_speaker_on() {
+    let node = video();
+    let view = node.open_pane("live", json!({"audio": true})).unwrap();
+    assert_eq!(view.video()["audio"], json!({"codec": "aac", "rate": 48000, "channels": 1}));
+    sleep(Duration::from_millis(200));
+    assert_eq!(view.sound_count(), 0);
+    view.viewers(1).unwrap();
+    view.wait(WAIT, |v| v.sound_count() >= 5 && v.frame_count() >= 5).unwrap();
+    let sounds = view.sounds();
+    assert!(sounds.iter().all(|s| s.frames == 2 && s.aac.len() == 96), "{sounds:?}");
+    // in order, 2048 samples (42 ms) apart
+    for pair in sounds.windows(2) {
+        assert!((42..=43).contains(&(pair[1].captured_ms - pair[0].captured_ms)), "{pair:?}");
+    }
+    // the speaker off: sound stops, pictures don't, and the rate stays as it was
+    view.audio_hint(false).unwrap();
+    sleep(Duration::from_millis(100));
+    assert!(still_for_sound(&view, Duration::from_millis(300)));
+    assert!(!still_for(&view, Duration::from_millis(300)));
+    view.audio_hint(true).unwrap();
+    let back = view.sound_count();
+    view.wait(WAIT, |v| v.sound_count() > back + 2).unwrap();
+    view.viewers(0).unwrap();
+    sleep(Duration::from_millis(100));
+    assert!(still_for_sound(&view, Duration::from_millis(300)));
+    assert!(view.problems().is_empty(), "{:?}", view.problems());
+}
+
+#[test]
+fn sound_from_a_pane_that_opened_without_it_is_refused() {
+    let node = video();
+    let view = node.open_pane("live", json!({"undeclared": true})).unwrap();
+    view.viewers(1).unwrap();
+    view.wait(WAIT, |v| !v.problems().is_empty()).unwrap();
+    assert_eq!(view.problems()[0], "pane.audio on a video pane that opened without audio");
+    assert_eq!(view.sound_count(), 0);
+}
+
+/// The count of sound over a while: the same at both ends means none came.
+fn still_for_sound(view: &PaneView, quiet: Duration) -> bool {
+    let before = view.sound_count();
+    sleep(quiet);
+    view.sound_count() == before
+}

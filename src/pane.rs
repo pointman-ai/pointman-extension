@@ -33,9 +33,11 @@
 //!
 //! A `video` pane (Pointman's docs/dev/video.md) opens with `{"title": …, "video": {codec, width,
 //! height, fps}}` and then sends frames, [`Pane::frame`], which the node seals and sends straight to
-//! the app. [`Pane::on_viewers`] hears how many of the app's paths are attached, so a camera runs
-//! only while someone's watching, and the app's hints (`{kind: "hint", max_fps, max_width}`, where
-//! `max_fps: 0` pauses) come as inputs.
+//! the app. With `audio` in its `video` (`{"codec": "aac", "rate": 48000, "channels": 1}`) it sends
+//! sound too, [`Pane::audio`]. [`Pane::on_viewers`] hears how many of the app's paths are attached, so
+//! a camera runs only while someone's watching, and the app's hints (`{kind: "hint", max_fps,
+//! max_width, audio}`, where `max_fps: 0` pauses the pictures and `audio: false` the sound) come as
+//! inputs.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,9 +53,11 @@ use crate::{base64, caused_by, guarded, id_text, lock, read, spawn, text_or, to_
 /// The most a video frame may be once the node has sealed it (docs/dev/video.md): the node drops a
 /// bigger one, so [`Pane::frame`] doesn't send it.
 pub const VIDEO_FRAME_MAX: usize = 4 << 20;
-/// What sealing adds to a frame's JPEG: the 20-byte header (captured_ms, seq, width, height) and the
-/// 16-byte tag.
-const SEALING: usize = 20 + 16;
+/// What sealing adds to a frame's JPEG on the wire: the 12-byte nonce, the 20-byte header
+/// (captured_ms, seq, width, height) and the 16-byte tag.
+pub const SEALING: usize = 12 + 20 + 16;
+/// The most sound one `pane.audio` may carry: whole ADTS frames, 64 KiB.
+pub const AUDIO_MAX: usize = 64 << 10;
 
 /// Turn down a pane's input: the app undoes what it showed early (a card snaps back) and shows
 /// why. `return Err(Refused::new("Linear decides when parents close").into())`.
@@ -124,6 +128,7 @@ struct Inner {
     on_viewers: Mutex<Vec<ViewersFn>>,
     viewers: AtomicU64,
     too_big: AtomicBool,
+    too_much_sound: AtomicBool,
     queue: Mutex<Option<Sender<Message>>>,
     handle: Handle,
 }
@@ -344,6 +349,28 @@ impl Pane {
         true
     }
 
+    /// Sound for a `video` pane that opened with `audio`: one or more whole ADTS frames of AAC, the
+    /// first sample captured at `captured_ms` (Unix time in ms), about every 20 to 100 ms. Unlike
+    /// frames the node queues sound in order (up to 500 ms a path), so send all of it, in order. Like
+    /// frames, sound sent before the open is answered or after the close is dropped, and so is more
+    /// than [`AUDIO_MAX`] at once (logged once); false says so.
+    pub fn audio(&self, aac: &[u8], captured_ms: u64) -> bool {
+        if aac.len() > AUDIO_MAX {
+            if !self.0.too_much_sound.swap(true, Ordering::SeqCst) {
+                let size = aac.len();
+                self.0.handle.log(format!("pane {}: {size} bytes of sound at once is over 64 KiB: dropped", self.0.id));
+            }
+            return false;
+        }
+        let params = json!({"pane": self.0.id, "captured_ms": captured_ms, "aac": base64(aac)});
+        let gate = lock(&self.0.gate);
+        if gate.closed.is_some() || gate.held.is_some() {
+            return false;
+        }
+        self.0.handle.send(&json!({"jsonrpc": "2.0", "method": "pane.audio", "params": params}));
+        true
+    }
+
     /// `f(pane, reason)` once it's closed, by either side: stop what feeds it.
     pub fn on_close<F, R>(&self, f: F) -> &Self
     where
@@ -468,6 +495,7 @@ pub(crate) fn message(
             on_viewers: Mutex::default(),
             viewers: AtomicU64::new(0),
             too_big: AtomicBool::new(false),
+            too_much_sound: AtomicBool::new(false),
             queue: Mutex::new(Some(tx)),
             handle: h.clone(),
         }));
@@ -601,7 +629,7 @@ fn opened(pane: &Pane, answer: Value, format: Option<String>) -> anyhow::Result<
         "blocks" => ("blocks", Value::is_array, "an array"),
         "board" => ("board", Value::is_object, "an object"),
         "page" => ("path", Value::is_string, "a string"),
-        "video" => ("video", is_video, "an object with its codec, width, height and fps"),
+        "video" => ("video", is_video, "an object with its codec, width, height and fps (and any audio's codec, rate 8000-96000 and channels 1 or 2)"),
         _ => bail!("the {} pane has no format (blocks, board, page or video) in extension.toml", pane.0.open),
     };
     if !answer.get(key).is_some_and(ok) {
@@ -710,9 +738,15 @@ pub fn board_changes(old: &Value, new: &Value) -> Vec<Value> {
     ops
 }
 
-/// What a `video` pane opens with: `{codec, width, height, fps}`.
+/// What a `video` pane opens with: `{codec, width, height, fps}`, and `audio: {codec, rate, channels}`
+/// if it has sound.
 fn is_video(v: &Value) -> bool {
-    v["codec"].is_string() && ["width", "height", "fps"].iter().all(|k| v[*k].is_number())
+    let audio = &v["audio"];
+    let sound = audio.is_null()
+        || (audio["codec"].is_string()
+            && audio["rate"].as_u64().is_some_and(|r| (8000..=96000).contains(&r))
+            && audio["channels"].as_u64().is_some_and(|c| c == 1 || c == 2));
+    v["codec"].is_string() && ["width", "height", "fps"].iter().all(|k| v[*k].is_number()) && sound
 }
 
 fn kind_of(v: &Value) -> &'static str {
@@ -788,6 +822,25 @@ mod tests {
             ]
         );
         assert!(board_changes(&new, &new).is_empty());
+    }
+
+    #[test]
+    fn a_video_opens_with_its_size_and_any_sound() {
+        let video = json!({"codec": "mjpeg", "width": 1280, "height": 720, "fps": 15});
+        assert!(is_video(&video));
+        let mut with = video.clone();
+        with["audio"] = json!({"codec": "aac", "rate": 48000, "channels": 2});
+        assert!(is_video(&with));
+        for bad in [
+            json!({"codec": "aac", "rate": 7000, "channels": 1}),
+            json!({"codec": "aac", "rate": 48000, "channels": 3}),
+            json!({"rate": 48000, "channels": 1}),
+            json!("aac"),
+        ] {
+            with["audio"] = bad.clone();
+            assert!(!is_video(&with), "{bad}");
+        }
+        assert!(!is_video(&json!({"codec": "mjpeg", "width": 1280})));
     }
 
     #[test]

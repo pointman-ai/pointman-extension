@@ -1,6 +1,8 @@
-//! A video pane from the Rust SDK: it opens with its size and rate, sends frames only while the node
-//! says a path is attached, and follows the app's hints (`max_fps: 0` pauses it). Its frames stand in
-//! for a camera's JPEGs: a JPEG's first and last markers around a count.
+//! A video pane from the Rust SDK: it opens with its size and rate (and its sound's, with
+//! `{"audio": true}`), sends frames and sound only while the node says a path is attached, and follows
+//! the app's hints (`max_fps: 0` pauses the pictures, `audio: false` the sound). Its frames stand in
+//! for a camera's JPEGs: a JPEG's first and last markers around a count; its sound is ADTS frames of
+//! silence's length, headers and zeros.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,9 +25,13 @@ fn main() -> anyhow::Result<()> {
         pane.handle().event("video.early", json!({"sent": early}));
 
         let fps = Arc::new(AtomicU64::new(30));
+        let speaker = Arc::new(AtomicBool::new(true));
         let running: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::default();
+        // with audio, it says so; undeclared, it sends sound anyway, which the node would refuse
+        let with_audio = pane.target()["audio"] == true;
+        let sounds = with_audio || pane.target()["undeclared"] == true;
 
-        let (rate, feed) = (fps.clone(), running.clone());
+        let (rate, feed, on) = (fps.clone(), running.clone(), speaker.clone());
         pane.on_viewers(move |pane: &Pane, attached: u64| {
             let mut feed = feed.lock().unwrap();
             if attached == 0 {
@@ -36,6 +42,10 @@ fn main() -> anyhow::Result<()> {
                 let stop = Arc::new(AtomicBool::new(false));
                 *feed = Some(stop.clone());
                 let (pane, rate) = (pane.clone(), rate.clone());
+                if sounds {
+                    let (pane, on, stop) = (pane.clone(), on.clone(), stop.clone());
+                    thread::spawn(move || speak(&pane, &on, &stop));
+                }
                 thread::spawn(move || send(&pane, &rate, &stop, size));
             }
             pane.handle().event("video.watching", json!({"attached": attached, "viewers": pane.viewers()}));
@@ -44,7 +54,13 @@ fn main() -> anyhow::Result<()> {
             if event["kind"] != "hint" {
                 return Err(Refused::new("a video pane takes hints only").into());
             }
-            fps.store(event["max_fps"].as_u64().unwrap_or(30).min(30), Ordering::SeqCst);
+            // a hint says only what changed: the speaker's alone has no rate
+            if let Some(max) = event["max_fps"].as_f64() {
+                fps.store((max.ceil() as u64).min(30), Ordering::SeqCst);
+            }
+            if let Some(on) = event["audio"].as_bool() {
+                speaker.store(on, Ordering::SeqCst);
+            }
             Ok(())
         });
         pane.on_close(move |pane: &Pane, reason: &str| {
@@ -53,7 +69,11 @@ fn main() -> anyhow::Result<()> {
             }
             pane.handle().event("video.closed", json!({"pane": pane.id(), "reason": reason}));
         });
-        Ok(json!({"title": "Test card", "video": {"codec": "mjpeg", "width": 64, "height": 48, "fps": 30}}))
+        let mut video = json!({"codec": "mjpeg", "width": 64, "height": 48, "fps": 30});
+        if with_audio {
+            video["audio"] = json!({"codec": "aac", "rate": 48000, "channels": 1});
+        }
+        Ok(json!({"title": "Test card", "video": video}))
     });
 
     ext.run()
@@ -75,6 +95,26 @@ fn send(pane: &Pane, fps: &AtomicU64, stop: &AtomicBool, size: usize) {
         thread::sleep(Duration::from_millis(1000 / rate));
     }
     h.event("video.capturing", json!({"on": false}));
+}
+
+/// Sound while the speaker's on, two ADTS frames (2048 samples at 48 kHz, 43 ms) at a time, timed by its
+/// samples from when it started, until stopped.
+fn speak(pane: &Pane, on: &AtomicBool, stop: &AtomicBool) {
+    let (start, mut samples) = (now_ms(), 0u64);
+    while !stop.load(Ordering::SeqCst) {
+        if on.load(Ordering::SeqCst) {
+            pane.audio(&[adts(40), adts(56)].concat(), start + samples * 1000 / 48000);
+            samples += 2048;
+        }
+        thread::sleep(Duration::from_millis(43));
+    }
+}
+
+/// An ADTS frame of `len` bytes: its header (AAC-LC, 48 kHz, mono, no CRC), then zeros.
+fn adts(len: usize) -> Vec<u8> {
+    let mut f = vec![0xff, 0xf1, 0x4c, 0x40 | (len >> 11) as u8, (len >> 3) as u8, ((len & 7) << 5) as u8 | 0x1f, 0xfc];
+    f.resize(len, 0);
+    f
 }
 
 /// `size` bytes from a JPEG's start marker to its end marker, with the count after the start.

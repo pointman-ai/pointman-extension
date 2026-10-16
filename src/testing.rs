@@ -44,7 +44,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::{guarded, id_text, load_manifest, lock, resolve, PROTOCOL, VIDEO_FRAME_MAX};
+use crate::{guarded, id_text, load_manifest, lock, resolve, AUDIO_MAX, PROTOCOL, SEALING, VIDEO_FRAME_MAX};
 
 /// What a stand-in passes on from its own environment, as a node does: never the board's tokens.
 pub const ENV_KEEP: [&str; 7] = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "PYTHONUTF8"];
@@ -53,6 +53,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const FRAME_MAX: usize = 1 << 20;
 /// How many of a video pane's newest frames a [`PaneView`] keeps.
 pub const VIDEO_FRAMES_KEPT: usize = 32;
+/// How many of a video pane's newest `pane.audio`s a [`PaneView`] keeps.
+pub const AUDIO_KEPT: usize = 256;
 
 type MethodFn = Arc<dyn Fn(Value) -> anyhow::Result<Value> + Send + Sync>;
 type ThenFn = Box<dyn FnOnce(&Value) + Send>;
@@ -131,6 +133,15 @@ pub struct VideoFrame {
     pub width: u16,
     pub height: u16,
     pub jpeg: Vec<u8>,
+}
+
+/// One `pane.audio` a `video` pane sent, its AAC decoded: whole ADTS frames.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sound {
+    pub captured_ms: u64,
+    pub aac: Vec<u8>,
+    /// How many ADTS frames it holds.
+    pub frames: usize,
 }
 
 /// How to open one pane: `PaneOptions { context: json!({"thread": "thr_1"}), ..Default::default() }`.
@@ -862,6 +873,8 @@ struct ViewState {
     video: Value,
     video_frames: VecDeque<VideoFrame>,
     frame_count: u64,
+    sounds: VecDeque<Sound>,
+    sound_count: u64,
 }
 
 impl PaneView {
@@ -904,6 +917,16 @@ impl PaneView {
         lock(&self.view.state).frame_count
     }
 
+    /// The newest sound a `video` pane sent (at most [`AUDIO_KEPT`] `pane.audio`s), oldest first.
+    pub fn sounds(&self) -> Vec<Sound> {
+        lock(&self.view.state).sounds.iter().cloned().collect()
+    }
+
+    /// How many `pane.audio`s a `video` pane has sent in all.
+    pub fn sound_count(&self) -> u64 {
+        lock(&self.view.state).sound_count
+    }
+
     /// The block with this id, anywhere in the tree.
     pub fn block(&self, id: &str) -> Option<Value> {
         let state = lock(&self.view.state);
@@ -930,7 +953,8 @@ impl PaneView {
 
     /// What the node would have refused, and why: a patch that doesn't apply, a set over 1 MiB, a
     /// block with no id or type, or an id used twice; a video frame that isn't a whole JPEG, has no
-    /// size, or is over 4 MiB sealed, or a frame or a set on the wrong kind of pane.
+    /// size, or is over 4 MiB sealed, or a frame or a set on the wrong kind of pane; sound that isn't
+    /// whole ADTS frames, is over 64 KiB, or comes from a pane that opened without `audio`.
     pub fn problems(&self) -> Vec<String> {
         lock(&self.view.state).problems.clone()
     }
@@ -955,6 +979,14 @@ impl PaneView {
         let seq = self.shared.ids.fetch_add(1, Ordering::SeqCst) + 1;
         let event = json!({"kind": "hint", "max_fps": max_fps, "max_width": max_width});
         let params = json!({"pane": self.view.id, "seq": seq, "event": event});
+        self.shared.request("pane.input", params, CALL_TIMEOUT).map(drop)
+    }
+
+    /// The app's speaker button for a `video` pane with sound, as the node passes it on: a hint with
+    /// only `audio`. Waits for the answer.
+    pub fn audio_hint(&self, on: bool) -> Result<(), Failed> {
+        let seq = self.shared.ids.fetch_add(1, Ordering::SeqCst) + 1;
+        let params = json!({"pane": self.view.id, "seq": seq, "event": {"kind": "hint", "audio": on}});
         self.shared.request("pane.input", params, CALL_TIMEOUT).map(drop)
     }
 
@@ -1000,6 +1032,25 @@ impl PaneView {
 impl View {
     fn took(&self, method: &str, p: &Value, record: bool) {
         let mut state = lock(&self.state);
+        if method == "pane.audio" {
+            if !state.opened {
+                state.problems.push("pane.audio before the pane was open".into());
+            } else if state.closed.is_none() {
+                match sound(state.format.as_deref(), &state.video, p) {
+                    Ok(sound) => {
+                        state.sound_count += 1;
+                        if state.sounds.len() == AUDIO_KEPT {
+                            state.sounds.pop_front();
+                        }
+                        state.sounds.push_back(sound);
+                    }
+                    Err(problem) => state.problems.push(problem),
+                }
+            }
+            state.changes += 1;
+            self.changed.notify_all();
+            return;
+        }
         if method == "pane.frame" {
             if !state.opened {
                 state.problems.push("pane.frame before the pane was open".into());
@@ -1091,7 +1142,7 @@ fn video_frame(format: Option<&str>, p: &Value) -> Result<VideoFrame, String> {
     if !(jpeg.starts_with(&[0xff, 0xd8]) && jpeg.ends_with(&[0xff, 0xd9])) {
         return Err(format!("pane.frame: {} bytes that aren't a whole JPEG (FF D8 … FF D9)", jpeg.len()));
     }
-    if jpeg.len() + 36 > VIDEO_FRAME_MAX {
+    if jpeg.len() + SEALING > VIDEO_FRAME_MAX {
         return Err(format!("pane.frame: {} bytes is over the 4 MiB a frame, sealed", jpeg.len()));
     }
     let size = |key: &str| p[key].as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0);
@@ -1100,6 +1151,44 @@ fn video_frame(format: Option<&str>, p: &Value) -> Result<VideoFrame, String> {
     };
     let captured_ms = p["captured_ms"].as_u64().ok_or("pane.frame has no captured_ms")?;
     Ok(VideoFrame { captured_ms, width, height, jpeg })
+}
+
+/// A `pane.audio` as the node takes it, or why it would drop it.
+fn sound(format: Option<&str>, video: &Value, p: &Value) -> Result<Sound, String> {
+    if format != Some("video") {
+        return Err(format!("pane.audio on a {} pane: only a video pane has sound", format.unwrap_or("formatless")));
+    }
+    if video["audio"].is_null() {
+        return Err("pane.audio on a video pane that opened without audio".into());
+    }
+    let aac = p["aac"].as_str().and_then(unbase64).ok_or("pane.audio: its aac isn't base64")?;
+    if aac.is_empty() || aac.len() > AUDIO_MAX {
+        return Err(format!("pane.audio: {} bytes, not 1 to 64 KiB", aac.len()));
+    }
+    let frames =
+        adts_frames(&aac).ok_or_else(|| format!("pane.audio: {} bytes that aren't whole ADTS frames", aac.len()))?;
+    let captured_ms = p["captured_ms"].as_u64().ok_or("pane.audio has no captured_ms")?;
+    Ok(Sound { captured_ms, aac, frames })
+}
+
+/// How many ADTS frames `aac` is, if it's nothing but whole ones: each a sync word (twelve 1 bits), a
+/// header of 7 bytes (9 with a CRC), and the length its header says.
+pub fn adts_frames(aac: &[u8]) -> Option<usize> {
+    let (mut at, mut count) = (0, 0);
+    while at < aac.len() {
+        let h = aac.get(at..at + 7)?;
+        if h[0] != 0xff || h[1] & 0xf0 != 0xf0 {
+            return None;
+        }
+        let header = if h[1] & 1 == 1 { 7 } else { 9 };
+        let len = (usize::from(h[3] & 3) << 11) | (usize::from(h[4]) << 3) | usize::from(h[5] >> 5);
+        if len < header || at + len > aac.len() {
+            return None;
+        }
+        at += len;
+        count += 1;
+    }
+    (count > 0).then_some(count)
 }
 
 /// Standard base64, padded, as a frame's `jpeg` is; None if it isn't.
@@ -1366,7 +1455,10 @@ fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allows_secret, apply_patch, block_problems, board_problems, unbase64, video_frame, VideoFrame};
+    use super::{
+        adts_frames, allows_secret, apply_patch, block_problems, board_problems, sound, unbase64, video_frame,
+        VideoFrame,
+    };
     use crate::pointer;
     use serde_json::{json, Value};
 
@@ -1480,6 +1572,41 @@ mod tests {
             (Some("video"), json!({"width": 1, "height": 1, "jpeg": crate::base64(&jpeg)}), "no captured_ms"),
         ] {
             let e = video_frame(format, &p).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
+    }
+
+    /// An ADTS frame's header for `len` bytes in all (AAC-LC, 48 kHz, mono, no CRC), then zeros.
+    fn adts(len: usize) -> Vec<u8> {
+        let mut f =
+            vec![0xff, 0xf1, 0x4c, 0x40 | (len >> 11) as u8, (len >> 3) as u8, ((len & 7) << 5) as u8 | 0x1f, 0xfc];
+        f.resize(len, 0);
+        f
+    }
+
+    #[test]
+    fn sound_is_whole_adts_frames_under_64_kib_from_a_pane_that_has_it() {
+        assert_eq!(adts_frames(&adts(7)), Some(1));
+        assert_eq!(adts_frames(&[adts(200), adts(9), adts(371)].concat()), Some(3));
+        assert_eq!(adts_frames(&adts(200)[..199]), None, "cut short");
+        assert_eq!(adts_frames(&[adts(20), vec![0x00]].concat()), None, "a stray byte");
+        assert_eq!(adts_frames(&[]), None);
+        let with = json!({"codec": "mjpeg", "audio": {"codec": "aac", "rate": 48000, "channels": 1}});
+        let p = |aac: &[u8]| json!({"pane": "pane_1", "captured_ms": 9, "aac": crate::base64(aac)});
+        let two = [adts(100), adts(120)].concat();
+        assert_eq!(
+            sound(Some("video"), &with, &p(&two)),
+            Ok(super::Sound { captured_ms: 9, aac: two.clone(), frames: 2 })
+        );
+        let lots: Vec<u8> = (0..70).flat_map(|_| adts(1000)).collect();
+        for (format, video, p, why) in [
+            (Some("blocks"), &with, p(&two), "only a video pane has sound"),
+            (Some("video"), &json!({"codec": "mjpeg"}), p(&two), "opened without audio"),
+            (Some("video"), &with, p(&two[..50]), "aren't whole ADTS frames"),
+            (Some("video"), &with, p(&lots), "not 1 to 64 KiB"),
+            (Some("video"), &with, json!({"aac": crate::base64(&two)}), "no captured_ms"),
+        ] {
+            let e = sound(format, video, &p).unwrap_err();
             assert!(e.contains(why), "{e}");
         }
     }

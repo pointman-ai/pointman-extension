@@ -31,7 +31,8 @@
 //! Panes ([`Extension::pane`], [`Pane`]): the extension answers `pane.open` for each of its
 //! manifest's `[[panes]]` with the first content, then keeps it current; each pane's open, inputs,
 //! context and close run in order on a thread of its own. A `video` pane sends frames instead
-//! ([`Pane::frame`]), while the node says someone's watching ([`Pane::on_viewers`]).
+//! ([`Pane::frame`]), and sound if it has any ([`Pane::audio`]), while the node says someone's watching
+//! ([`Pane::on_viewers`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -51,7 +52,7 @@ use serde_json::{json, Map, Value};
 mod pane;
 pub mod testing;
 
-pub use pane::{board_changes, changes, pointer, Pane, Refused, VIDEO_FRAME_MAX};
+pub use pane::{board_changes, changes, pointer, Pane, Refused, AUDIO_MAX, SEALING, VIDEO_FRAME_MAX};
 
 /// The protocol version this SDK speaks.
 pub const PROTOCOL: u64 = 1;

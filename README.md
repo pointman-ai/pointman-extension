@@ -102,17 +102,22 @@ whole JPEGs while the node says a path is attached:
 ext.pane("live", |pane: &Pane| {
     pane.on_viewers(|pane: &Pane, attached: u64| { /* start capturing above 0, stop at 0 */ });
     pane.on_input(|pane: &Pane, event: &Value| -> anyhow::Result<()> {
-        // the app's hint: {"kind": "hint", "max_fps": 15, "max_width": 1280}; max_fps 0 pauses
+        // the app's hint: {"kind": "hint", "max_fps": 15, "max_width": 1280}; max_fps 0 pauses; the
+        // speaker's is {"kind": "hint", "audio": false}. A hint carries only what changed
         Ok(())
     });
     pane.on_close(|pane: &Pane, reason: &str| { /* stop capturing */ });
-    Ok(json!({"title": "Camera", "video": {"codec": "mjpeg", "width": 1280, "height": 720, "fps": 15}}))
+    Ok(json!({"title": "Camera", "video": {"codec": "mjpeg", "width": 1280, "height": 720, "fps": 15,
+              "audio": {"codec": "aac", "rate": 48000, "channels": 1}}}))  // audio only with sound
 });
-// from the capture thread: pane.frame(&jpeg, width, height, captured_ms), the newest each time
+// from the capture thread: pane.frame(&jpeg, width, height, captured_ms), the newest each time;
+// from the sound's: pane.audio(&adts, captured_ms), whole ADTS frames every 20 to 100 ms, all of them
 ```
 
 Frames are lossy and newest-wins: one sent before the open is answered, after the pane closes, or
-over 4 MiB once sealed (`VIDEO_FRAME_MAX`, logged once) is dropped, and `frame` says false.
+over 4 MiB once sealed (`VIDEO_FRAME_MAX`, logged once) is dropped, and `frame` says false. Sound isn't:
+the node queues it in order, up to 500 ms a path, so send it all; more than 64 KiB at once (`AUDIO_MAX`)
+is dropped.
 `pane.viewers()` is the node's last count. examples/video is one.
 
 ## Testing
@@ -142,11 +147,13 @@ view.look_at(json!({"thread": "thr_1"}))?; view.close("closed")?; // wait(timeou
 let live = node.open_pane("live", json!({}))?;           // a video pane: live.video() is what it opened with
 live.viewers(1)?; live.hint(15, 1280)?;                  // a path attached; the app's hint
 live.wait(timeout, |v| v.frame_count() >= 3)?;           // video_frames(): the newest, JPEGs decoded
+live.audio_hint(false)?;                                 // the speaker; sounds(), sound_count()
 ```
 
 A pane's view keeps its content as an app would, with every set and patch applied; `problems()`
 lists what the node would refuse (a patch that doesn't apply, a set over 1 MiB, a block with no id
-or type, or an id used twice; a video frame that isn't a whole JPEG or is over 4 MiB sealed).
+or type, or an id used twice; a video frame that isn't a whole JPEG or is over 4 MiB sealed; sound that
+isn't whole ADTS frames, is over 64 KiB, or comes from a pane that opened without `audio`).
 
 A failure is a `testing::Failed { message, retry, cancelled }`, whose Display is the extension's own
 message.
