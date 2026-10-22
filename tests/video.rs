@@ -165,3 +165,34 @@ fn still_for_sound(view: &PaneView, quiet: Duration) -> bool {
     sleep(quiet);
     view.sound_count() == before
 }
+
+#[test]
+fn a_video_pane_takes_control_inputs_only_while_a_grant_holds() {
+    let node = video();
+    let view = node.open_pane("live", Value::Null).unwrap();
+    let click = json!({"kind": "pointer", "x": 0.5, "y": 0.25, "phase": "down", "button": "left", "clicks": 1});
+    let refused = view.control_input(click.clone()).unwrap_err();
+    assert!(refused.to_string().contains("control is off"), "{refused}");
+
+    view.control(Some(1_792_000_000), "james", "MacBook Pro").unwrap();
+    assert_eq!(
+        node.wait_event("video.control", WAIT).unwrap(),
+        json!({"grant": {"until": 1_792_000_000u64, "by": "james", "device": "MacBook Pro"}})
+    );
+    view.control_input(click.clone()).unwrap();
+    assert_eq!(node.wait_event("video.controlled", WAIT).unwrap(), click);
+
+    view.control(None, "james", "MacBook Pro").unwrap();
+    assert_eq!(node.wait_event("video.control", WAIT).unwrap(), json!({"grant": null}));
+    assert!(view.control_input(click).is_err());
+    view.hint(10, 640).unwrap(); // hints never needed control
+}
+
+#[test]
+fn a_grant_the_extension_turns_down_says_why() {
+    let node = video();
+    let view = node.open_pane("live", json!({"locked": true})).unwrap();
+    let refused = view.control(Some(1_792_000_000), "james", "MacBook Pro").unwrap_err();
+    assert!(refused.to_string().contains("can't be controlled"), "{refused}");
+    view.control(None, "james", "MacBook Pro").unwrap(); // ending one that never held is fine
+}

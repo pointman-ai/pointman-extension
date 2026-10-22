@@ -990,6 +990,24 @@ impl PaneView {
         self.shared.request("pane.input", params, CALL_TIMEOUT).map(drop)
     }
 
+    /// The node gives a person control of a `video` pane (`pane.control {pane, until, by, device}`,
+    /// `until` in unix seconds), or ends it (`until` None). Waits for the extension's answer: a refusal
+    /// is a [`Failed`] whose message is its reason.
+    pub fn control(&self, until: Option<u64>, by: &str, device: &str) -> Result<(), Failed> {
+        let params = json!({"pane": self.view.id, "until": until, "by": by, "device": device});
+        self.shared.request("pane.control", params, CALL_TIMEOUT).map(drop)
+    }
+
+    /// An input that controls a `video` pane (`{"kind": "pointer", "x": 0.5, "y": 0.5, "phase": "down",
+    /// "button": "left", "clicks": 1}`, `scroll`, `key` or `text`), as the node passes it on while a grant
+    /// holds. Waits for the answer.
+    pub fn control_input(&self, event: Value) -> Result<(), Failed> {
+        let seq = self.shared.ids.fetch_add(1, Ordering::SeqCst) + 1;
+        self.shared
+            .request("pane.input", json!({"pane": self.view.id, "seq": seq, "event": event}), CALL_TIMEOUT)
+            .map(drop)
+    }
+
     /// What the person is looking at changed: `pane.context`.
     pub fn look_at(&self, context: Value) -> Result<(), Failed> {
         self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.context",

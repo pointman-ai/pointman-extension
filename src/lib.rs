@@ -582,7 +582,10 @@ impl Extension {
             });
             return true;
         }
-        if matches!(method.as_str(), "pane.open" | "pane.input" | "pane.context" | "pane.viewers" | "pane.close") {
+        if matches!(
+            method.as_str(),
+            "pane.open" | "pane.input" | "pane.context" | "pane.viewers" | "pane.control" | "pane.close"
+        ) {
             let opener = match method.as_str() {
                 "pane.open" => params["open"].as_str().and_then(|open| {
                     Some((self.openers.get(open)?.clone(), self.pane_formats.get(open).cloned().flatten()))

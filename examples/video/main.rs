@@ -1,6 +1,7 @@
 //! A video pane from the Rust SDK: it opens with its size and rate (and its sound's, with
 //! `{"audio": true}`), sends frames and sound only while the node says a path is attached, and follows
-//! the app's hints (`max_fps: 0` pauses the pictures, `audio: false` the sound). Its frames stand in
+//! the app's hints (`max_fps: 0` pauses the pictures, `audio: false` the sound), and takes pointer and
+//! key inputs only while the node says a person has control. Its frames stand in
 //! for a camera's JPEGs: a JPEG's first and last markers around a count; its sound is ADTS frames of
 //! silence's length, headers and zeros.
 
@@ -50,7 +51,26 @@ fn main() -> anyhow::Result<()> {
             }
             pane.handle().event("video.watching", json!({"attached": attached, "viewers": pane.viewers()}));
         });
-        pane.on_input(move |_: &Pane, event: &Value| -> anyhow::Result<()> {
+        // control: a grant from `by` until a time, which a target of {"locked": true} turns down (as a
+        // machine without the permission would); while it holds, pointer and key inputs are taken
+        let controlled: Arc<Mutex<Option<Value>>> = Arc::default();
+        let (held, locked) = (controlled.clone(), pane.target()["locked"] == true);
+        pane.on_control(move |pane: &Pane, grant: Option<&Value>| -> anyhow::Result<()> {
+            if grant.is_some() && locked {
+                return Err(Refused::new("this test card can't be controlled").into());
+            }
+            *held.lock().unwrap() = grant.cloned();
+            pane.handle().event("video.control", json!({"grant": grant}));
+            Ok(())
+        });
+        pane.on_input(move |pane: &Pane, event: &Value| -> anyhow::Result<()> {
+            if matches!(event["kind"].as_str(), Some("pointer" | "scroll" | "key" | "text")) {
+                if controlled.lock().unwrap().is_none() {
+                    return Err(Refused::new("control is off").into());
+                }
+                pane.handle().event("video.controlled", event.clone());
+                return Ok(());
+            }
             if event["kind"] != "hint" {
                 return Err(Refused::new("a video pane takes hints only").into());
             }

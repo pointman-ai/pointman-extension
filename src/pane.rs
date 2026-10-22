@@ -92,11 +92,13 @@ pub(crate) type OpenFn = Arc<dyn Fn(&Pane) -> anyhow::Result<Value> + Send + Syn
 type InputFn = Arc<dyn Fn(&Pane, &Value) -> anyhow::Result<()> + Send + Sync>;
 type CloseFn = Arc<dyn Fn(&Pane, &str) -> anyhow::Result<()> + Send + Sync>;
 type ViewersFn = Arc<dyn Fn(&Pane, u64) -> anyhow::Result<()> + Send + Sync>;
+type ControlFn = Arc<dyn Fn(&Pane, Option<&Value>) -> anyhow::Result<()> + Send + Sync>;
 
 enum Message {
     Input(Value, Option<Value>),
     Context(Value),
     Viewers(u64),
+    Control(Option<Value>, Option<Value>),
     Close(String),
 }
 
@@ -126,6 +128,7 @@ struct Inner {
     on_context: Mutex<Vec<InputFn>>,
     on_close: Mutex<Vec<CloseFn>>,
     on_viewers: Mutex<Vec<ViewersFn>>,
+    control: Mutex<Option<ControlFn>>,
     viewers: AtomicU64,
     too_big: AtomicBool,
     too_much_sound: AtomicBool,
@@ -320,6 +323,22 @@ impl Pane {
         self
     }
 
+    /// `f(pane, grant)` when the node gives a person control of what a `video` pane shows
+    /// (`pane.control`, given as `{until, by, device}`: `until` unix seconds, `by` their handle, `device`
+    /// the device that signed it), and `f(pane, None)` when it ends: stopped, past `until`, or the pane
+    /// closed. While a grant holds, the node passes the app's `pointer`, `scroll`, `key` and `text`
+    /// inputs to [`Pane::on_input`]. Return an error (a [`Refused`] saying what's missing, such as a
+    /// permission the machine hasn't given) to turn a grant down: the node doesn't keep it, and the
+    /// app shows why. A pane with no handler refuses every grant.
+    pub fn on_control<F, R>(&self, f: F) -> &Self
+    where
+        F: Fn(&Pane, Option<&Value>) -> R + Send + Sync + 'static,
+        R: Outcome,
+    {
+        *lock(&self.0.control) = Some(Arc::new(move |pane: &Pane, grant: Option<&Value>| f(pane, grant).into_result()));
+        self
+    }
+
     /// How many of the app's paths are attached to a `video` pane now, as the node last said.
     pub fn viewers(&self) -> u64 {
         self.0.viewers.load(Ordering::SeqCst)
@@ -493,6 +512,7 @@ pub(crate) fn message(
             on_context: Mutex::default(),
             on_close: Mutex::default(),
             on_viewers: Mutex::default(),
+            control: Mutex::new(None),
             viewers: AtomicU64::new(0),
             too_big: AtomicBool::new(false),
             too_much_sound: AtomicBool::new(false),
@@ -520,6 +540,12 @@ pub(crate) fn message(
             let context = p.get("context").filter(|c| !c.is_null()).cloned().unwrap_or_else(|| json!({}));
             if let Some(tx) = lock(&pane.0.queue).as_ref() {
                 let _ = tx.send(Message::Context(context));
+            }
+        }
+        "pane.control" => {
+            let grant = grant_of(p);
+            if let Some(tx) = lock(&pane.0.queue).as_ref() {
+                let _ = tx.send(Message::Control(grant, rid));
             }
         }
         "pane.viewers" => {
@@ -601,19 +627,44 @@ fn run(pane: Pane, rx: Receiver<Message>, opener: OpenFn, format: Option<String>
                     None => Err(Refused::new("this pane takes no input").into()),
                     Some(f) => guarded(|| f(&pane, &event)),
                 };
-                let Some(rid) = rid else { continue };
-                h.send(&match outcome {
-                    Ok(()) => json!({"jsonrpc": "2.0", "id": rid, "result": {}}),
-                    Err(e) => {
-                        if !caused_by::<Refused>(&e) {
-                            h.log(format!("pane {} input {event}: {e:?}", pane.0.id));
-                        }
-                        json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": text_or(&e, "refused")}})
-                    }
-                });
+                answer(&pane, rid, outcome, &format!("input {event}"));
+            }
+            Message::Control(grant, rid) => {
+                let f = lock(&pane.0.control).clone();
+                let outcome = match (f, &grant) {
+                    (Some(f), _) => guarded(|| f(&pane, grant.as_ref())),
+                    (None, Some(_)) => Err(Refused::new("this pane can't be controlled").into()),
+                    (None, None) => Ok(()),
+                };
+                answer(&pane, rid, outcome, "control");
             }
         }
     }
+}
+
+/// A `pane.control`'s grant, `{until, by, device}`, or None when it ends. The node sends it nested,
+/// `{pane, control: {until, by, device} | null}`, or flat, `{pane, until, by, device}` with `until: null`
+/// to end it (both were settled at once in Pointman's thread 649 [18214]–[18217]).
+fn grant_of(p: &Value) -> Option<Value> {
+    let g = if p.get("control").is_some() { &p["control"] } else { p };
+    let until = g.get("until").filter(|u| !u.is_null())?;
+    Some(json!({"until": until, "by": g.get("by").cloned().unwrap_or(Value::Null),
+                "device": g.get("device").cloned().unwrap_or(Value::Null)}))
+}
+
+/// The answer to the node's request `rid`: `{}`, or the error's text (logged unless it's a [`Refused`]).
+fn answer(pane: &Pane, rid: Option<Value>, outcome: anyhow::Result<()>, what: &str) {
+    let Some(rid) = rid else { return };
+    let h = &pane.0.handle;
+    h.send(&match outcome {
+        Ok(()) => json!({"jsonrpc": "2.0", "id": rid, "result": {}}),
+        Err(e) => {
+            if !caused_by::<Refused>(&e) {
+                h.log(format!("pane {} {what}: {e:?}", pane.0.id));
+            }
+            json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": text_or(&e, "refused")}})
+        }
+    });
 }
 
 /// The open handler's answer, with the manifest's format, if it has what that format opens with.
@@ -851,5 +902,23 @@ mod tests {
                    {"op": "add", "path": "/b/count/value", "value": 3}])
         );
         assert!(set_ops("i", "x", &json!(null)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::grant_of;
+    use serde_json::json;
+
+    #[test]
+    fn a_grant_comes_flat_or_nested_and_null_ends_it() {
+        let want = json!({"until": 1_792_000_000u64, "by": "james", "device": "MacBook Pro"});
+        let flat = json!({"pane": "pane_3", "until": 1_792_000_000u64, "by": "james", "device": "MacBook Pro"});
+        let nested =
+            json!({"pane": "pane_3", "control": {"until": 1_792_000_000u64, "by": "james", "device": "MacBook Pro"}});
+        assert_eq!(grant_of(&flat), Some(want.clone()));
+        assert_eq!(grant_of(&nested), Some(want));
+        assert_eq!(grant_of(&json!({"pane": "pane_3", "until": null, "by": "james"})), None);
+        assert_eq!(grant_of(&json!({"pane": "pane_3", "control": null})), None);
     }
 }
