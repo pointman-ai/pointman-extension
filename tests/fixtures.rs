@@ -14,7 +14,12 @@ fn fixtures() -> Vec<(String, Value)> {
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
-        .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()))
+        .map(|p| {
+            (
+                p.file_stem().unwrap().to_string_lossy().into_owned(),
+                serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap(),
+            )
+        })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -37,11 +42,19 @@ fn each_fixture_reads_as_its_message_and_writes_back_the_same() {
         let info = METHODS.iter().find(|m| m.method == name).unwrap_or_else(|| panic!("no method {name}"));
         assert_eq!(fixture["method"], name.as_str(), "{name}'s own method");
         let params = &fixture["params"];
-        assert_eq!((info.round_trip.0)(params).unwrap_or_else(|e| panic!("{name} params: {e}")), *params, "{name} params");
+        assert_eq!(
+            (info.round_trip.0)(params).unwrap_or_else(|e| panic!("{name} params: {e}")),
+            *params,
+            "{name} params"
+        );
         match (info.notification, fixture.get("result")) {
             (true, None) => {}
             (false, Some(result)) => {
-                assert_eq!((info.round_trip.1)(result).unwrap_or_else(|e| panic!("{name} result: {e}")), *result, "{name} result")
+                assert_eq!(
+                    (info.round_trip.1)(result).unwrap_or_else(|e| panic!("{name} result: {e}")),
+                    *result,
+                    "{name} result"
+                )
             }
             (notification, result) => panic!("{name}: notification {notification}, result {result:?}"),
         }

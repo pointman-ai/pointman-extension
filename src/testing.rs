@@ -26,7 +26,7 @@
 //! patch applied ([`StandIn::open_pane`], [`PaneView`]). It checks blocks only for an id each,
 //! unique in the pane, and a type; the node checks them fully.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -41,21 +41,31 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use crate::protocol::pane_audio_request::Sound as SoundOf;
+use crate::protocol::pane_open_response::First;
+use crate::protocol::pane_open_response::Video;
 use crate::protocol::{
     CheckpointRequest, CommandCancelRequest, CommandId, CommandStartRequest, DoneRequest, EventRequest, FailedRequest,
-    InitializeRequest, InitializeResponse, OutputRequest, PaneClosedRequest, PaneEditRequest, PaneInputRequest, PaneOpenRequest,
-    PaneOpenResponse, PaneSetRequest, PaneTitleRequest, PaneViewer, ProgressRequest, SecretGetRequest, SecretGetResponse,
-    SecretListRequest, SecretListResponse,
+    InitializeRequest, InitializeResponse, OutputRequest, PaneClosedRequest, PaneEditRequest, PaneInputRequest,
+    PaneOpenRequest, PaneOpenResponse, PaneSetRequest, PaneTitleRequest, PaneViewer, ProgressRequest, SecretGetRequest,
+    SecretGetResponse, SecretListRequest, SecretListResponse,
 };
-use crate::protocol::pane_open_response::First;
+use crate::protocol::{PaneAudioRequest, PaneControlRequest, PaneFrameRequest, PaneViewersRequest};
 use crate::v1::{Block, MachineId, MemberRef, PaneContent, PaneContext, PaneFormat, PaneId, PaneInput};
-use crate::{convert, edits, from_params, guarded, load_manifest, lock, resolve, id_text, Request, PROTOCOL};
+use crate::{
+    convert, edits, from_params, guarded, id_text, load_manifest, lock, resolve, Request, AUDIO_MAX, PROTOCOL, SEALING,
+    VIDEO_FRAME_MAX,
+};
 
 /// What a stand-in passes on from its own environment, as a node does: never the board's tokens.
 pub const ENV_KEEP: [&str; 7] = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "PYTHONUTF8"];
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// A pane's frame, as the stream's limit: 1 MiB.
 pub const FRAME_MAX: usize = 1 << 20;
+/// How many of a video pane's newest frames a [`PaneView`] keeps.
+pub const VIDEO_FRAMES_KEPT: usize = 32;
+/// How many of a video pane's newest `pane.audio`s a [`PaneView`] keeps.
+pub const AUDIO_KEPT: usize = 256;
 
 type MethodFn = Arc<dyn Fn(Value) -> anyhow::Result<Value> + Send + Sync>;
 type ThenFn = Box<dyn FnOnce(&Value) + Send>;
@@ -112,6 +122,24 @@ impl Default for RunOptions {
     }
 }
 
+/// One frame a `video` pane sent (`pane.frame`), its JPEG decoded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoFrame {
+    pub captured_ms: u64,
+    pub width: u16,
+    pub height: u16,
+    pub jpeg: Vec<u8>,
+}
+
+/// One `pane.audio` a `video` pane sent, its AAC decoded: whole ADTS frames.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sound {
+    pub captured_ms: u64,
+    pub aac: Vec<u8>,
+    /// How many ADTS frames it holds.
+    pub frames: usize,
+}
+
 /// How to open one pane: `PaneOptions { context: PaneContext { item: Some("MB-1".into()), ..Default::default() }, ..Default::default() }`.
 #[derive(Debug, Clone)]
 pub struct PaneOptions {
@@ -124,7 +152,8 @@ pub struct PaneOptions {
 
 impl Default for PaneOptions {
     fn default() -> Self {
-        let person = MemberRef { kind: Some(crate::v1::member_ref::Kind::Handle("james".into())), ..Default::default() };
+        let person =
+            MemberRef { kind: Some(crate::v1::member_ref::Kind::Handle("james".into())), ..Default::default() };
         PaneOptions {
             context: PaneContext::default(),
             viewer: PaneViewer { person: person.into(), ..Default::default() },
@@ -394,7 +423,11 @@ impl StandIn {
             roots,
             ..Default::default()
         };
-        let info = match shared.request("initialize", serde_json::to_value(&hello).unwrap_or_default(), Duration::from_secs(20)) {
+        let info = match shared.request(
+            "initialize",
+            serde_json::to_value(&hello).unwrap_or_default(),
+            Duration::from_secs(20),
+        ) {
             Ok(info) => info,
             Err(e) => {
                 self.stop();
@@ -404,7 +437,12 @@ impl StandIn {
         let said: InitializeResponse = crate::from_json(info.clone()).unwrap_or_default();
         if said.protocol.as_known() != Some(PROTOCOL) {
             self.stop();
-            return Err(Failed::new(format!("{} speaks protocol {}, nodes {}", shared.id, info["protocol"], buffa::Enumeration::to_i32(&PROTOCOL))));
+            return Err(Failed::new(format!(
+                "{} speaks protocol {}, nodes {}",
+                shared.id,
+                info["protocol"],
+                buffa::Enumeration::to_i32(&PROTOCOL)
+            )));
         }
         if let Some(live) = self.live.as_mut() {
             live.info = info;
@@ -476,11 +514,16 @@ impl StandIn {
         }
     }
 
-    /// Cancel a running command, by its id: `{"found": bool}`.
-    pub fn cancel(&self, cid: &str) -> Result<Value, Failed> {
+    /// Cancel a running command, by its id: whether the extension was running it.
+    pub fn cancel(&self, cid: &str) -> Result<bool, Failed> {
         let id = CommandId { value: cid.to_string(), ..Default::default() };
         let request = CommandCancelRequest { id: id.into(), ..Default::default() };
-        self.live()?.shared.request("command.cancel", serde_json::to_value(request).unwrap_or_default(), CALL_TIMEOUT)
+        let answer = self.live()?.shared.request(
+            "command.cancel",
+            serde_json::to_value(request).unwrap_or_default(),
+            CALL_TIMEOUT,
+        )?;
+        Ok(crate::from_json::<crate::protocol::CommandCancelResponse>(answer).map(|a| a.found).unwrap_or(false))
     }
 
     /// Ask it one of its own methods (`ext.method`), as the node does, and wait up to 30 s.
@@ -490,7 +533,7 @@ impl StandIn {
 
     pub fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, Failed> {
         let params = if params.is_null() { json!({}) } else { params };
-        self.live()?.shared.request(method, params, timeout)
+        self.live()?.shared.request(method, params, timeout).map(convert::whole_numbers)
     }
 
     /// Open one of its `[[panes]]`, as the node does for an app, and wait for its answer.
@@ -776,7 +819,8 @@ impl Shared {
             } else {
                 match self.secrets.get(&name) {
                     Some(value) => {
-                        Ok(serde_json::to_value(SecretGetResponse { value: value.clone(), ..Default::default() }).unwrap_or_default())
+                        Ok(serde_json::to_value(SecretGetResponse { value: value.clone(), ..Default::default() })
+                            .unwrap_or_default())
                     }
                     None => Err(format!("no secret '{name}' in the vault")),
                 }
@@ -822,7 +866,9 @@ impl Shared {
             }
             "output" => record.outputs.extend(crate::from_json::<OutputRequest>(p.clone()).ok()),
             "done" => {
-                if let (Some((mut record, tx)), Ok(done)) = (runs.remove(&cid), crate::from_json::<DoneRequest>(p.clone())) {
+                if let (Some((mut record, tx)), Ok(done)) =
+                    (runs.remove(&cid), crate::from_json::<DoneRequest>(p.clone()))
+                {
                     record.result = done.result.as_option().map(convert::from_proto).unwrap_or(Value::Null);
                     let _ = tx.send(Ok(record));
                 }
@@ -863,12 +909,42 @@ struct ViewState {
     frames: Vec<(String, Value)>,
     problems: Vec<String>,
     changes: u64,
+    video: Option<Video>,
+    video_frames: VecDeque<VideoFrame>,
+    frame_count: u64,
+    sounds: VecDeque<Sound>,
+    sound_count: u64,
 }
 
 impl PaneView {
     /// Its id, as core would give it (`pane_3`).
     pub fn id(&self) -> &str {
         &self.view.id
+    }
+
+    /// What a `video` pane opened with: its size and rate, and any sound's.
+    pub fn video(&self) -> Option<Video> {
+        lock(&self.view.state).video.clone()
+    }
+
+    /// The newest frames a `video` pane sent (at most [`VIDEO_FRAMES_KEPT`]), oldest first.
+    pub fn video_frames(&self) -> Vec<VideoFrame> {
+        lock(&self.view.state).video_frames.iter().cloned().collect()
+    }
+
+    /// How many frames a `video` pane has sent in all.
+    pub fn frame_count(&self) -> u64 {
+        lock(&self.view.state).frame_count
+    }
+
+    /// The newest sound a `video` pane sent (at most [`AUDIO_KEPT`] `pane.audio`s), oldest first.
+    pub fn sounds(&self) -> Vec<Sound> {
+        lock(&self.view.state).sounds.iter().cloned().collect()
+    }
+
+    /// How many `pane.audio`s a `video` pane has sent in all.
+    pub fn sound_count(&self) -> u64 {
+        lock(&self.view.state).sound_count
     }
 
     /// Blocks, board, page, video or call.
@@ -951,6 +1027,54 @@ impl PaneView {
         self.input(PaneInput::new(&kind, Value::Object(fields)))
     }
 
+    /// How many of the app's paths are attached to a `video` pane now, as the node says when one attaches or drops:
+    /// `pane.viewers`.
+    pub fn viewers(&self, attached: u64) -> Result<(), Failed> {
+        let request = PaneViewersRequest {
+            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            attached: attached as i32,
+            ..Default::default()
+        };
+        self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.viewers", "params": request}))
+    }
+
+    /// The app's hint for a `video` pane, as the node passes it on (`pane.input` of kind `hint`): at most this many
+    /// frames a second (0 pauses it) and this wide. Waits for the answer.
+    pub fn hint(&self, max_fps: u64, max_width: u64) -> Result<(), Failed> {
+        self.input(PaneInput::new("hint", json!({"max_fps": max_fps, "max_width": max_width})))
+    }
+
+    /// The app's speaker button for a `video` pane with sound, as the node passes it on: a hint with only `audio`.
+    /// Waits for the answer.
+    pub fn audio_hint(&self, on: bool) -> Result<(), Failed> {
+        self.input(PaneInput::new("hint", json!({"audio": on})))
+    }
+
+    /// The node gives a person control of a `video` pane (`pane.control`: `until` in unix seconds, `by` their handle,
+    /// and their `device`), or ends it (`until` None). Waits for the extension's answer: a refusal is a [`Failed`]
+    /// whose message is its reason.
+    pub fn control(&self, until: Option<u64>, by: &str, device: &str) -> Result<(), Failed> {
+        let person =
+            MemberRef { kind: Some(crate::v1::member_ref::Kind::Handle(by.to_string())), ..Default::default() };
+        let request = PaneControlRequest {
+            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            until: until
+                .map(|s| buffa_types::google::protobuf::Timestamp { seconds: s as i64, ..Default::default() })
+                .into(),
+            by: person.into(),
+            device: Some(device.to_string()),
+            ..Default::default()
+        };
+        self.shared.request("pane.control", serde_json::to_value(request).unwrap_or_default(), CALL_TIMEOUT).map(drop)
+    }
+
+    /// An input that controls a `video` pane (`{"kind": "pointer", "x": 0.5, "y": 0.5, "phase": "down", "button":
+    /// "left", "clicks": 1}`, `scroll`, `key` or `text`), as the node passes it on while a grant holds. Waits for the
+    /// answer.
+    pub fn control_input(&self, event: Value) -> Result<(), Failed> {
+        self.input_json(event)
+    }
+
     /// What the person is looking at changed: `pane.context`.
     pub fn look_at(&self, context: PaneContext) -> Result<(), Failed> {
         let request = crate::protocol::PaneContextRequest {
@@ -984,7 +1108,8 @@ impl PaneView {
             let state = lock(&self.view.state);
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() || self.shared.gone.load(Ordering::SeqCst) {
-                let content = serde_json::to_string(&state.content).unwrap_or_default();
+                let mut content = serde_json::to_string(&state.content).unwrap_or_default();
+                content.truncate(content.char_indices().nth(600).map_or(content.len(), |(i, _)| i));
                 return Err(Failed::new(format!(
                     "pane {} didn't get there in {:.1} s: {content}",
                     self.view.id,
@@ -1001,6 +1126,38 @@ impl PaneView {
 impl View {
     fn took(&self, method: &str, p: &Value, record: bool) {
         let mut state = lock(&self.state);
+        if method == "pane.audio" || method == "pane.frame" {
+            if !state.opened {
+                state.problems.push(format!("{method} before the pane was open"));
+            } else if state.closed.is_none() {
+                if method == "pane.frame" {
+                    match video_frame(state.format, p) {
+                        Ok(frame) => {
+                            state.frame_count += 1;
+                            if state.video_frames.len() == VIDEO_FRAMES_KEPT {
+                                state.video_frames.pop_front();
+                            }
+                            state.video_frames.push_back(frame);
+                        }
+                        Err(problem) => state.problems.push(problem),
+                    }
+                } else {
+                    match sound(state.format, state.video.as_ref().is_some_and(|v| v.audio.is_set()), p) {
+                        Ok(sound) => {
+                            state.sound_count += 1;
+                            if state.sounds.len() == AUDIO_KEPT {
+                                state.sounds.pop_front();
+                            }
+                            state.sounds.push_back(sound);
+                        }
+                        Err(problem) => state.problems.push(problem),
+                    }
+                }
+            }
+            state.changes += 1;
+            self.changed.notify_all();
+            return;
+        }
         if record {
             state.frames.push((method.to_string(), p.clone()));
         }
@@ -1022,11 +1179,15 @@ impl View {
                                 state.content = *content;
                             }
                             Some(First::Page(page)) => state.path = Some(page.path),
+                            Some(First::Video(video)) => state.video = Some(*video),
                             _ => {}
                         }
                     }
                     Err(e) => state.problems.push(format!("the answer to pane.open isn't its message: {e}")),
                 },
+                "pane.set" | "pane.edit" if state.format == Some(PaneFormat::PANE_FORMAT_VIDEO) => {
+                    state.problems.push(format!("{method} on a video pane, which has frames, not content"))
+                }
                 "pane.set" => match crate::from_json::<PaneSetRequest>(p.clone()) {
                     Ok(set) => {
                         let content = set.content.into_option().unwrap_or_default();
@@ -1065,6 +1226,74 @@ impl View {
         state.changes += 1;
         self.changed.notify_all();
     }
+}
+
+/// A `pane.frame` as the node takes it, or why it would drop it.
+fn video_frame(format: Option<PaneFormat>, p: &Value) -> Result<VideoFrame, String> {
+    if format != Some(PaneFormat::PANE_FORMAT_VIDEO) {
+        let word = format.map_or("formatless", crate::pane::pane_format_word);
+        return Err(format!("pane.frame on a {word} pane: only a video pane has frames"));
+    }
+    let frame: PaneFrameRequest =
+        crate::from_json(p.clone()).map_err(|e| format!("pane.frame isn't its message: {e}"))?;
+    let jpeg = frame.jpeg;
+    if !(jpeg.starts_with(&[0xff, 0xd8]) && jpeg.ends_with(&[0xff, 0xd9])) {
+        return Err(format!("pane.frame: {} bytes that aren't a whole JPEG (FF D8 … FF D9)", jpeg.len()));
+    }
+    if jpeg.len() + SEALING > VIDEO_FRAME_MAX {
+        return Err(format!("pane.frame: {} bytes is over the 4 MiB a frame, sealed", jpeg.len()));
+    }
+    let size = |n: i32| u16::try_from(n).ok().filter(|n| *n > 0);
+    let (Some(width), Some(height)) = (size(frame.width), size(frame.height)) else {
+        return Err(format!("pane.frame: its size {}x{} isn't 1 to 65535 each way", frame.width, frame.height));
+    };
+    if p.get("capturedMs").is_none() {
+        return Err("pane.frame has no captured_ms".into());
+    }
+    Ok(VideoFrame { captured_ms: frame.captured_ms as u64, width, height, jpeg })
+}
+
+/// A `pane.audio` as the node takes it, or why it would drop it.
+fn sound(format: Option<PaneFormat>, has_audio: bool, p: &Value) -> Result<Sound, String> {
+    if format != Some(PaneFormat::PANE_FORMAT_VIDEO) {
+        let word = format.map_or("formatless", crate::pane::pane_format_word);
+        return Err(format!("pane.audio on a {word} pane: only a video pane has sound"));
+    }
+    if !has_audio {
+        return Err("pane.audio on a video pane that opened without audio".into());
+    }
+    let audio: PaneAudioRequest =
+        crate::from_json(p.clone()).map_err(|e| format!("pane.audio isn't its message: {e}"))?;
+    let Some(SoundOf::Aac(aac)) = audio.sound else { return Err("pane.audio: a video pane's sound is aac".into()) };
+    if aac.is_empty() || aac.len() > AUDIO_MAX {
+        return Err(format!("pane.audio: {} bytes, not 1 to 64 KiB", aac.len()));
+    }
+    let frames =
+        adts_frames(&aac).ok_or_else(|| format!("pane.audio: {} bytes that aren't whole ADTS frames", aac.len()))?;
+    if p.get("capturedMs").is_none() {
+        return Err("pane.audio has no captured_ms".into());
+    }
+    Ok(Sound { captured_ms: audio.captured_ms as u64, aac, frames })
+}
+
+/// How many ADTS frames `aac` is, if it's nothing but whole ones: each a sync word (twelve 1 bits), a header of 7
+/// bytes (9 with a CRC), and the length its header says.
+pub fn adts_frames(aac: &[u8]) -> Option<usize> {
+    let (mut at, mut count) = (0, 0);
+    while at < aac.len() {
+        let h = aac.get(at..at + 7)?;
+        if h[0] != 0xff || h[1] & 0xf0 != 0xf0 {
+            return None;
+        }
+        let header = if h[1] & 1 == 1 { 7 } else { 9 };
+        let len = (usize::from(h[3] & 3) << 11) | (usize::from(h[4]) << 3) | usize::from(h[5] >> 5);
+        if len < header || at + len > aac.len() {
+            return None;
+        }
+        at += len;
+        count += 1;
+    }
+    (count > 0).then_some(count)
 }
 
 fn set_problems(format: Option<PaneFormat>, content: &PaneContent) -> Vec<String> {
@@ -1156,15 +1385,11 @@ fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{allows_secret, block_problems, board_problems};
-    use crate::v1::{block::Family, layout, Block, Layout, Text};
+    use crate::v1::{block::Family, layout, Block, Layout};
     use serde_json::json;
 
     fn text(name: Option<&str>) -> Block {
-        Block {
-            name: name.map(String::from),
-            family: Some(Family::Text(Box::new(Text::default()))),
-            ..Default::default()
-        }
+        Block { name: name.map(String::from), family: Some(Family::Text(Box::default())), ..Default::default() }
     }
 
     #[test]

@@ -23,7 +23,8 @@ const ROOT: &str = "pointman/extension/v1/protocol.proto";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [from, to] = [args.first(), args.get(1)].map(|a| a.expect("usage: trim_descriptors <core descriptors.pb> <out>"));
+    let [from, to] =
+        [args.first(), args.get(1)].map(|a| a.expect("usage: trim_descriptors <core descriptors.pb> <out>"));
     let bytes = std::fs::read(from).unwrap_or_else(|e| panic!("can't read {from}: {e}"));
     let all = FileDescriptorSet::decode_from_slice(&bytes).expect("a FileDescriptorSet");
     let by_name: HashMap<&str, usize> =

@@ -51,7 +51,8 @@ fn plus(name: &str) -> Block {
 }
 
 fn log(name: &str, ticks: u64) -> Block {
-    let items = (1..=ticks).map(|i| list::Item { id: format!("t{i}"), title: format!("Tick {i}"), ..Default::default() });
+    let items =
+        (1..=ticks).map(|i| list::Item { id: format!("t{i}"), title: format!("Tick {i}"), ..Default::default() });
     let list = List { items: items.collect(), ..Default::default() };
     Block { name: Some(name.into()), family: Some(Family::List(Box::new(list))), ..Default::default() }
 }
@@ -181,4 +182,3 @@ fn main() -> anyhow::Result<()> {
 
     ext.run()
 }
-

@@ -5,6 +5,7 @@ mod common;
 use std::path::Path;
 
 use common::{example, package, source};
+use pointman_extension::protocol::output_request::Role;
 use pointman_extension::testing::StandIn;
 use serde_json::json;
 
@@ -19,6 +20,7 @@ fn greet_writes_the_greeting() {
     assert_eq!(done.result, json!({"text": "Hi, James!"}));
     assert_eq!(std::fs::read_to_string(&done.outputs[0].path).unwrap(), "Hi, James!\n");
     assert_eq!(done.outputs[0].kind, "text");
+    assert_eq!(done.outputs[0].role.as_known(), Some(Role::Main));
     assert_eq!(done.progress[0].fraction, Some(0.5));
     assert_eq!(node.events()["hello.last"], json!({"name": "James"}));
 }
@@ -41,10 +43,10 @@ fn a_missing_name_fails() {
 fn as_installed_it_runs_bin_hello_from_its_folder() {
     let root = package("hello");
     let node = StandIn::new(&root).start().unwrap();
-    assert_eq!(node.info(), json!({"protocol": 1, "id": "hello", "version": "0.1.0"}));
+    assert_eq!(node.info(), json!({"protocol": "PROTOCOL_TYPED", "id": "hello", "version": "0.1.0"}));
     let done = node.run("hello.greet", json!({"name": "Grace"})).unwrap();
     assert_eq!(done.result, json!({"text": "Hello, Grace!"}));
-    assert!(done.outputs[0].path.starts_with(node.work_dir()));
+    assert!(Path::new(&done.outputs[0].path).starts_with(node.work_dir()));
     node.stop();
     assert!(!node.running());
     std::fs::remove_dir_all(root).unwrap();

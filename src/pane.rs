@@ -40,6 +40,7 @@
 //! in place.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -48,12 +49,26 @@ use buffa_types::google::protobuf::Struct;
 use serde_json::{json, Value};
 
 use crate::protocol::{
-    pane_open_response::{First, Page},
-    PaneCloseRequest, PaneClosedRequest, PaneContextRequest, PaneEditRequest, PaneInputRequest, PaneInputResponse,
-    PaneOpenRequest, PaneOpenResponse, PaneSetRequest, PaneTitleRequest, PaneViewer,
+    pane_audio_request::Sound,
+    pane_open_response::{First, Page, Video},
+    PaneAudioRequest, PaneCloseRequest, PaneClosedRequest, PaneContextRequest, PaneControlRequest, PaneControlResponse,
+    PaneEditRequest, PaneFrameRequest, PaneInputRequest, PaneInputResponse, PaneOpenRequest, PaneOpenResponse,
+    PaneSetRequest, PaneTitleRequest, PaneViewer, PaneViewersRequest,
 };
 use crate::v1::{Block, PaneContent, PaneContext, PaneEdit, PaneFormat, PaneId, PaneInput};
-use crate::{caused_by, convert, edits, from_params, guarded, lock, read, spawn, text_or, to_json, write, Handle, Notification, Outcome};
+use crate::{
+    caused_by, convert, edits, from_params, guarded, lock, read, spawn, text_or, to_json, write, Handle, Notification,
+    Outcome,
+};
+
+/// The most a video frame may be once the node has sealed it (docs/dev/video.md): the node drops a
+/// bigger one, so [`Pane::frame`] doesn't send it.
+pub const VIDEO_FRAME_MAX: usize = 4 << 20;
+/// What sealing adds to a frame's JPEG on the wire: the 12-byte nonce, the 20-byte header
+/// (captured_ms, seq, width, height) and the 16-byte tag.
+pub const SEALING: usize = 12 + 20 + 16;
+/// The most sound one `pane.audio` may carry: whole ADTS frames, 64 KiB.
+pub const AUDIO_MAX: usize = 64 << 10;
 
 /// Turn down a pane's input: the app undoes what it showed early (a card snaps back) and shows
 /// why. `return Err(Refused::new("Linear decides when parents close").into())`.
@@ -112,6 +127,11 @@ impl PaneOpenResponse {
         PaneOpenResponse { first: Some(First::Content(Box::new(content))), ..Default::default() }
     }
 
+    /// A video pane's first answer: its size and rate, and its sound's if it has any.
+    pub fn video(video: Video) -> Self {
+        PaneOpenResponse { first: Some(First::Video(Box::new(video))), ..Default::default() }
+    }
+
     /// With a title; unset, an earlier title, else the manifest's.
     pub fn titled(mut self, title: &str) -> Self {
         self.title = Some(title.to_string());
@@ -123,10 +143,14 @@ pub(crate) type OpenFn = Arc<dyn Fn(&Pane) -> anyhow::Result<PaneOpenResponse> +
 type InputFn = Arc<dyn Fn(&Pane, &PaneInput) -> anyhow::Result<()> + Send + Sync>;
 type ContextFn = Arc<dyn Fn(&Pane, &PaneContext) -> anyhow::Result<()> + Send + Sync>;
 type CloseFn = Arc<dyn Fn(&Pane, &str) -> anyhow::Result<()> + Send + Sync>;
+type ViewersFn = Arc<dyn Fn(&Pane, u64) -> anyhow::Result<()> + Send + Sync>;
+type ControlFn = Arc<dyn Fn(&Pane, Option<&PaneControlRequest>) -> anyhow::Result<()> + Send + Sync>;
 
 enum Message {
     Input(PaneInput, Option<Value>),
     Context(PaneContext),
+    Viewers(u64),
+    Control(PaneControlRequest, Option<Value>),
     Close(String),
 }
 
@@ -155,6 +179,11 @@ struct Inner {
     input: Mutex<Option<InputFn>>,
     on_context: Mutex<Vec<ContextFn>>,
     on_close: Mutex<Vec<CloseFn>>,
+    on_viewers: Mutex<Vec<ViewersFn>>,
+    control: Mutex<Option<ControlFn>>,
+    viewers: AtomicU64,
+    too_big: AtomicBool,
+    too_much_sound: AtomicBool,
     queue: Mutex<Option<Sender<Message>>>,
     handle: Handle,
 }
@@ -254,7 +283,9 @@ impl Pane {
         let new = PaneContent { board: convert::to_struct(board).into(), ..Default::default() };
         let edits = match &*last {
             Last::Known(old) if *old == new => return,
-            Last::Known(old) => edits::board_diff(&convert::from_struct(old.board.as_option().unwrap_or(&Struct::default())), board),
+            Last::Known(old) => {
+                edits::board_diff(&convert::from_struct(old.board.as_option().unwrap_or(&Struct::default())), board)
+            }
             Last::Unset | Last::Unknown => None,
         };
         self.send_diff(&mut last, new, edits);
@@ -264,7 +295,9 @@ impl Pane {
         match edits {
             Some(edits) if edits.is_empty() => {} // only what's the person's changed (the open tab)
             Some(edits) => self.notify(&PaneEditRequest { pane: self.pane_id(), edits, ..Default::default() }),
-            None => self.notify(&PaneSetRequest { pane: self.pane_id(), content: new.clone().into(), ..Default::default() }),
+            None => {
+                self.notify(&PaneSetRequest { pane: self.pane_id(), content: new.clone().into(), ..Default::default() })
+            }
         }
         *last = Last::Known(new);
     }
@@ -290,7 +323,7 @@ impl Pane {
 
     /// Put one board item (a JSON object with its `id`): replaced where it is, or added.
     pub fn put_board_item(&self, item: &Value) {
-        self.edit(vec![edits::put_board_items(&[item.clone()])]);
+        self.edit(vec![edits::put_board_items(std::slice::from_ref(item))]);
     }
 
     pub fn set_title(&self, title: &str) {
@@ -300,7 +333,11 @@ impl Pane {
     /// Close it from the extension's side: what it showed is gone, say.
     pub fn close(&self, reason: &str) {
         if self.drop_it(reason) {
-            self.0.handle.notify(&PaneClosedRequest { pane: self.pane_id(), reason: reason.to_string(), ..Default::default() });
+            self.0.handle.notify(&PaneClosedRequest {
+                pane: self.pane_id(),
+                reason: reason.to_string(),
+                ..Default::default()
+            });
         }
     }
 
@@ -322,8 +359,96 @@ impl Pane {
         F: Fn(&Pane, &PaneContext) -> R + Send + Sync + 'static,
         R: Outcome,
     {
-        lock(&self.0.on_context).push(Arc::new(move |pane: &Pane, context: &PaneContext| f(pane, context).into_result()));
+        lock(&self.0.on_context)
+            .push(Arc::new(move |pane: &Pane, context: &PaneContext| f(pane, context).into_result()));
         self
+    }
+
+    /// `f(pane, attached)` when the number of the app's paths attached to a `video` pane changes: start capturing
+    /// when it's above 0, and stop at 0, so a camera's light is off when no one is watching.
+    pub fn on_viewers<F, R>(&self, f: F) -> &Self
+    where
+        F: Fn(&Pane, u64) -> R + Send + Sync + 'static,
+        R: Outcome,
+    {
+        lock(&self.0.on_viewers).push(Arc::new(move |pane: &Pane, attached: u64| f(pane, attached).into_result()));
+        self
+    }
+
+    /// `f(pane, grant)` when the node gives a person control of what a `video` pane shows (`pane.control`: the
+    /// request has `until`, `by` and `device`), and `f(pane, None)` when it ends: stopped, past `until`, or the pane
+    /// closed. While a grant holds, the node passes the app's `pointer`, `scroll`, `key` and `text` inputs to
+    /// [`Pane::on_input`]. Return an error (a [`Refused`] saying what's missing, such as a permission the machine
+    /// hasn't given) to turn a grant down: the node doesn't keep it, and the app shows why. A pane with no handler
+    /// refuses every grant.
+    pub fn on_control<F, R>(&self, f: F) -> &Self
+    where
+        F: Fn(&Pane, Option<&PaneControlRequest>) -> R + Send + Sync + 'static,
+        R: Outcome,
+    {
+        *lock(&self.0.control) =
+            Some(Arc::new(move |pane: &Pane, grant: Option<&PaneControlRequest>| f(pane, grant).into_result()));
+        self
+    }
+
+    /// How many of the app's paths are attached to a `video` pane now, as the node last said.
+    pub fn viewers(&self) -> u64 {
+        self.0.viewers.load(Ordering::SeqCst)
+    }
+
+    /// One frame of a `video` pane: a whole JPEG, `width` by `height`, captured at `captured_ms` (Unix time in ms).
+    /// Lossy and newest-wins, so it's never held: one sent before the pane's open is answered, after it's closed, or
+    /// too big once sealed ([`VIDEO_FRAME_MAX`]: logged once) is dropped, and false says so.
+    pub fn frame(&self, jpeg: &[u8], width: u16, height: u16, captured_ms: u64) -> bool {
+        if jpeg.len() + SEALING > VIDEO_FRAME_MAX {
+            if !self.0.too_big.swap(true, Ordering::SeqCst) {
+                let size = jpeg.len();
+                self.0
+                    .handle
+                    .log(format!("pane {}: a frame of {size} bytes is over the 4 MiB a frame: dropped", self.0.id));
+            }
+            return false;
+        }
+        let frame = PaneFrameRequest {
+            pane: self.pane_id(),
+            captured_ms: captured_ms as i64,
+            width: i32::from(width),
+            height: i32::from(height),
+            jpeg: jpeg.to_vec(),
+            ..Default::default()
+        };
+        self.send_now(&frame)
+    }
+
+    /// Sound for a `video` pane that opened with `audio`: one or more whole ADTS frames of AAC, the first sample
+    /// captured at `captured_ms` (Unix time in ms), about every 20 to 100 ms. Unlike frames the node queues sound in
+    /// order (up to 500 ms a path), so send all of it, in order. Like frames, sound sent before the open is answered
+    /// or after the close is dropped, and so is more than [`AUDIO_MAX`] at once (logged once); false says so.
+    pub fn audio(&self, aac: &[u8], captured_ms: u64) -> bool {
+        if aac.len() > AUDIO_MAX {
+            if !self.0.too_much_sound.swap(true, Ordering::SeqCst) {
+                let size = aac.len();
+                self.0.handle.log(format!("pane {}: {size} bytes of sound at once is over 64 KiB: dropped", self.0.id));
+            }
+            return false;
+        }
+        let sound = PaneAudioRequest {
+            pane: self.pane_id(),
+            captured_ms: captured_ms as i64,
+            sound: Some(Sound::Aac(aac.to_vec())),
+            ..Default::default()
+        };
+        self.send_now(&sound)
+    }
+
+    /// Sent at once, or not at all: before the open is answered or after the close, there's nobody to send it to.
+    fn send_now<N: Notification>(&self, n: &N) -> bool {
+        let gate = lock(&self.0.gate);
+        if gate.closed.is_some() || gate.held.is_some() {
+            return false;
+        }
+        self.0.handle.send(&json!({"jsonrpc": "2.0", "method": N::METHOD, "params": to_json(n)}));
+        true
     }
 
     /// `f(pane, reason)` once it's closed, by either side: stop what feeds it.
@@ -380,7 +505,13 @@ fn error(h: &Handle, rid: Option<Value>, message: String) {
 
 /// One of the node's `pane.*` messages. `opener` is the open handler and the manifest's format
 /// for a `pane.open`.
-pub(crate) fn message(h: &Handle, method: &str, params: Value, rid: Option<Value>, opener: Option<(OpenFn, Option<String>)>) {
+pub(crate) fn message(
+    h: &Handle,
+    method: &str,
+    params: Value,
+    rid: Option<Value>,
+    opener: Option<(OpenFn, Option<String>)>,
+) {
     if method == "pane.open" {
         let request: PaneOpenRequest = match from_params(params, method) {
             Ok(request) => request,
@@ -411,6 +542,11 @@ pub(crate) fn message(h: &Handle, method: &str, params: Value, rid: Option<Value
             input: Mutex::new(None),
             on_context: Mutex::default(),
             on_close: Mutex::default(),
+            on_viewers: Mutex::default(),
+            control: Mutex::new(None),
+            viewers: AtomicU64::new(0),
+            too_big: AtomicBool::new(false),
+            too_much_sound: AtomicBool::new(false),
             queue: Mutex::new(Some(tx)),
             handle: h.clone(),
         }));
@@ -421,7 +557,15 @@ pub(crate) fn message(h: &Handle, method: &str, params: Value, rid: Option<Value
     }
     let pid = match method {
         "pane.input" => from_params::<PaneInputRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option()),
-        "pane.context" => from_params::<PaneContextRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option()),
+        "pane.context" => {
+            from_params::<PaneContextRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option())
+        }
+        "pane.viewers" => {
+            from_params::<PaneViewersRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option())
+        }
+        "pane.control" => {
+            from_params::<PaneControlRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option())
+        }
         _ => from_params::<PaneCloseRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option()),
     }
     .map(|p| p.value)
@@ -436,13 +580,35 @@ pub(crate) fn message(h: &Handle, method: &str, params: Value, rid: Option<Value
             pane.drop_it(if reason.is_empty() { "closed" } else { &reason });
         }
         "pane.context" => {
-            let context = from_params::<PaneContextRequest>(params, method).ok().and_then(|r| r.context.into_option()).unwrap_or_default();
+            let context = from_params::<PaneContextRequest>(params, method)
+                .ok()
+                .and_then(|r| r.context.into_option())
+                .unwrap_or_default();
             if let Some(tx) = lock(&pane.0.queue).as_ref() {
                 let _ = tx.send(Message::Context(context));
             }
         }
+        "pane.control" => {
+            let Ok(grant) = from_params::<PaneControlRequest>(params, method) else {
+                return error(h, rid, "pane.control isn't its message".into());
+            };
+            if let Some(tx) = lock(&pane.0.queue).as_ref() {
+                let _ = tx.send(Message::Control(grant, rid));
+            }
+        }
+        "pane.viewers" => {
+            let attached =
+                from_params::<PaneViewersRequest>(params, method).map(|r| r.attached).unwrap_or(0).max(0) as u64;
+            pane.0.viewers.store(attached, Ordering::SeqCst);
+            if let Some(tx) = lock(&pane.0.queue).as_ref() {
+                let _ = tx.send(Message::Viewers(attached));
+            }
+        }
         _ => {
-            let event = from_params::<PaneInputRequest>(params, method).ok().and_then(|r| r.event.into_option()).unwrap_or_default();
+            let event = from_params::<PaneInputRequest>(params, method)
+                .ok()
+                .and_then(|r| r.event.into_option())
+                .unwrap_or_default();
             if let Some(tx) = lock(&pane.0.queue).as_ref() {
                 let _ = tx.send(Message::Input(event, rid));
             }
@@ -501,25 +667,56 @@ fn run(pane: Pane, rx: Receiver<Message>, opener: OpenFn, format: Option<String>
                     }
                 }
             }
+            Message::Viewers(attached) => {
+                let handlers = lock(&pane.0.on_viewers).clone();
+                for f in handlers {
+                    if let Err(e) = guarded(|| f(&pane, attached)) {
+                        h.log(format!("pane {} on_viewers: {e:?}", pane.0.id));
+                    }
+                }
+            }
             Message::Input(event, rid) => {
                 let f = lock(&pane.0.input).clone();
                 let outcome = match f {
                     None => Err(Refused::new("this pane takes no input").into()),
                     Some(f) => guarded(|| f(&pane, &event)),
                 };
-                let Some(rid) = rid else { continue };
-                h.send(&match outcome {
-                    Ok(()) => json!({"jsonrpc": "2.0", "id": rid, "result": to_json(PaneInputResponse::default())}),
-                    Err(e) => {
-                        if !caused_by::<Refused>(&e) {
-                            h.log(format!("pane {} input {} {}: {e:?}", pane.0.id, event.kind, event.json()));
-                        }
-                        json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": text_or(&e, "refused")}})
-                    }
-                });
+                answer(
+                    &pane,
+                    rid,
+                    outcome,
+                    to_json(PaneInputResponse::default()),
+                    &format!("input {} {}", event.kind, event.json()),
+                );
+            }
+            Message::Control(grant, rid) => {
+                let f = lock(&pane.0.control).clone();
+                // no `until`: nobody controls it now
+                let given = grant.until.is_set().then_some(&grant);
+                let outcome = match (f, given) {
+                    (Some(f), _) => guarded(|| f(&pane, given)),
+                    (None, Some(_)) => Err(Refused::new("this pane can't be controlled").into()),
+                    (None, None) => Ok(()),
+                };
+                answer(&pane, rid, outcome, to_json(PaneControlResponse::default()), "control");
             }
         }
     }
+}
+
+/// The answer to the node's request `rid`: `result`, or the error's text (logged unless it's a [`Refused`]).
+fn answer(pane: &Pane, rid: Option<Value>, outcome: anyhow::Result<()>, result: Value, what: &str) {
+    let Some(rid) = rid else { return };
+    let h = &pane.0.handle;
+    h.send(&match outcome {
+        Ok(()) => json!({"jsonrpc": "2.0", "id": rid, "result": result}),
+        Err(e) => {
+            if !caused_by::<Refused>(&e) {
+                h.log(format!("pane {} {what}: {e:?}", pane.0.id));
+            }
+            json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": text_or(&e, "refused")}})
+        }
+    });
 }
 
 /// The format a manifest's `format` names.
@@ -545,18 +742,27 @@ fn opened(pane: &Pane, mut answer: PaneOpenResponse, format: Option<String>) -> 
         (PaneFormat::PANE_FORMAT_BLOCKS, Some(First::Content(c))) => (c.board.is_unset(), "its content, as blocks"),
         (PaneFormat::PANE_FORMAT_BOARD, Some(First::Content(c))) => (c.board.is_set(), "its content, as a board"),
         (PaneFormat::PANE_FORMAT_PAGE, Some(First::Page(p))) => (!p.path.is_empty(), "its page, with a path"),
-        (PaneFormat::PANE_FORMAT_VIDEO, Some(First::Video(_))) => (true, ""),
+        (PaneFormat::PANE_FORMAT_VIDEO, Some(First::Video(v))) => (is_video(v), VIDEO_WANTS),
         (PaneFormat::PANE_FORMAT_CALL, Some(First::Call(_))) => (true, ""),
         (PaneFormat::PANE_FORMAT_BLOCKS, _) => (false, "its content, as blocks"),
         (PaneFormat::PANE_FORMAT_BOARD, _) => (false, "its content, as a board"),
         (PaneFormat::PANE_FORMAT_PAGE, _) => (false, "its page, with a path"),
-        (PaneFormat::PANE_FORMAT_VIDEO, _) => (false, "its video"),
+        (PaneFormat::PANE_FORMAT_VIDEO, _) => (false, VIDEO_WANTS),
         _ => (false, "its call"),
     };
     if !ok {
         bail!("a {} pane opens with {what}", pane_format_word(format));
     }
     Ok(answer)
+}
+
+const VIDEO_WANTS: &str =
+    "its video, with its codec, a size of 1 to 65535 each way, a rate above 0 to 240, and any audio's codec, rate 8000-96000 and channels 1 or 2";
+
+/// What a `video` pane opens with: its codec, size and rate, and any sound's codec, rate and channels.
+fn is_video(v: &Video) -> bool {
+    let sound = v.audio.as_option().is_none_or(|a| (8000..=96000).contains(&a.rate) && (1..=2).contains(&a.channels));
+    (1..=65535).contains(&v.width) && (1..=65535).contains(&v.height) && v.fps > 0.0 && v.fps <= 240.0 && sound
 }
 
 pub(crate) fn pane_format_word(format: PaneFormat) -> &'static str {

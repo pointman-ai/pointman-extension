@@ -164,11 +164,9 @@ fn parent_list<'a>(blocks: &'a mut Vec<Block>, parent: Option<&str>) -> Result<&
     parent_in(blocks, parent).ok_or_else(|| format!("no stack or tab {parent:?}"))
 }
 
-fn parent_in<'a>(blocks: &'a mut Vec<Block>, parent: &str) -> Option<&'a mut Vec<Block>> {
-    for i in 0..blocks.len() {
-        if let Some(k) = list_named(&blocks[i], parent) {
-            return children_mut(&mut blocks[i]).into_iter().nth(k);
-        }
+fn parent_in<'a>(blocks: &'a mut [Block], parent: &str) -> Option<&'a mut Vec<Block>> {
+    if let Some((i, k)) = blocks.iter().enumerate().find_map(|(i, b)| list_named(b, parent).map(|k| (i, k))) {
+        return children_mut(&mut blocks[i]).into_iter().nth(k);
     }
     for b in blocks.iter_mut() {
         for kids in children_mut(b) {
@@ -197,7 +195,11 @@ fn place(c: &mut PaneContent, parent: Option<&str>, after: Option<&str>, b: Bloc
     let at = match after {
         None => 0,
         Some(after) => {
-            siblings.iter().position(|x| x.name.as_deref() == Some(after)).ok_or_else(|| format!("no block {after:?} there to follow"))? + 1
+            siblings
+                .iter()
+                .position(|x| x.name.as_deref() == Some(after))
+                .ok_or_else(|| format!("no block {after:?} there to follow"))?
+                + 1
         }
     };
     siblings.insert(at, b);
@@ -421,8 +423,12 @@ fn item_list(b: &Block) -> Option<Vec<(String, pane_edit::Item)>> {
                 .collect()
         }
         Family::View(v) => match v.kind.as_ref()? {
-            view::Kind::Waterfall(w) => w.spans.iter().map(|i| (i.id.clone(), ItemKind::Span(Box::new(i.clone())))).collect(),
-            view::Kind::Traces(t) => t.items.iter().map(|i| (i.id.clone(), ItemKind::Trace(Box::new(i.clone())))).collect(),
+            view::Kind::Waterfall(w) => {
+                w.spans.iter().map(|i| (i.id.clone(), ItemKind::Span(Box::new(i.clone())))).collect()
+            }
+            view::Kind::Traces(t) => {
+                t.items.iter().map(|i| (i.id.clone(), ItemKind::Trace(Box::new(i.clone())))).collect()
+            }
             _ => return None,
         },
         _ => return None,
@@ -445,7 +451,14 @@ pub fn remove_items(block: Option<&str>, ids: Vec<String>) -> PaneEdit {
 }
 
 pub fn replace(block: Block, keep_items: bool) -> PaneEdit {
-    PaneEdit { edit: Some(Edit::Replace(Box::new(pane_edit::Replace { block: block.into(), keep_items, ..Default::default() }))), ..Default::default() }
+    PaneEdit {
+        edit: Some(Edit::Replace(Box::new(pane_edit::Replace {
+            block: block.into(),
+            keep_items,
+            ..Default::default()
+        }))),
+        ..Default::default()
+    }
 }
 
 /// What changed in one block (not a layout) from `old` to `new`: its items by id, and its own fields alone when
@@ -464,7 +477,8 @@ fn block_edits(old: &Block, new: &Block) -> Vec<PaneEdit> {
     if without_items(old) != without_items(new) {
         edits.push(replace(without_items(new), true));
     }
-    let gone: Vec<String> = was.iter().map(|(id, _)| id.clone()).filter(|id| !now.iter().any(|(n, _)| n == id)).collect();
+    let gone: Vec<String> =
+        was.iter().map(|(id, _)| id.clone()).filter(|id| !now.iter().any(|(n, _)| n == id)).collect();
     if !gone.is_empty() {
         edits.push(remove_items(Some(name), gone));
     }
@@ -497,7 +511,10 @@ impl Parent {
 }
 
 /// Every list of blocks in a tree, by its parent, with the names in it, in order; and where each block is.
-fn layout_of(blocks: &[Block]) -> Option<(HashMap<Parent, Vec<String>>, HashMap<String, Parent>, Vec<String>)> {
+/// Every list in a tree by its parent, where each block is, and every name in order.
+type Shape = (HashMap<Parent, Vec<String>>, HashMap<String, Parent>, Vec<String>);
+
+fn layout_of(blocks: &[Block]) -> Option<Shape> {
     fn go(
         blocks: &[Block],
         parent: Parent,
@@ -514,8 +531,8 @@ fn layout_of(blocks: &[Block]) -> Option<(HashMap<Parent, Vec<String>>, HashMap<
             }
             order.push(name.clone());
             names.push(name.clone());
-            match b.family.as_ref() {
-                Some(Family::Layout(l)) => match l.kind.as_ref() {
+            if let Some(Family::Layout(l)) = b.family.as_ref() {
+                match l.kind.as_ref() {
                     Some(layout::Kind::Stack(s)) => go(&s.children, Parent::Stack(name), lists, at, order, tabs)?,
                     Some(layout::Kind::Tabs(t)) => {
                         for tab in &t.tabs {
@@ -526,8 +543,7 @@ fn layout_of(blocks: &[Block]) -> Option<(HashMap<Parent, Vec<String>>, HashMap<
                         }
                     }
                     None => {}
-                },
-                _ => {}
+                }
             }
         }
         lists.insert(parent, names);
@@ -568,7 +584,9 @@ pub fn diff(old: &[Block], new: &[Block]) -> Option<Vec<PaneEdit>> {
     for name in &whole {
         let (a, b) = (was[*name], now[*name]);
         let (before, after) = (inside(a), inside(b));
-        if before.iter().any(|n| now.contains_key(n) && !after.contains(n)) || after.iter().any(|n| was.contains_key(n) && !before.contains(n)) {
+        if before.iter().any(|n| now.contains_key(n) && !after.contains(n))
+            || after.iter().any(|n| was.contains_key(n) && !before.contains(n))
+        {
             return None;
         }
     }
@@ -601,6 +619,7 @@ pub fn diff(old: &[Block], new: &[Block]) -> Option<Vec<PaneEdit>> {
     // placed: each list in the new tree, parents first, in order after the one before it
     let mut parents: Vec<Parent> = vec![Parent::Top];
     let mut inserted: HashSet<String> = HashSet::new();
+    let mut sent_whole: HashSet<String> = HashSet::new();
     let mut i = 0;
     while i < parents.len() {
         let parent = parents[i].clone();
@@ -656,13 +675,10 @@ pub fn diff(old: &[Block], new: &[Block]) -> Option<Vec<PaneEdit>> {
                 let at = prev.as_ref().and_then(|p| list.iter().position(|x| x == p)).map_or(0, |p| p + 1);
                 list.insert(at, name.clone());
                 loc.insert(name.clone(), parent.clone());
+                inserted.insert(name.clone());
                 if all_new {
-                    for x in walk(b) {
-                        let x_name = x.name.clone().unwrap_or_default();
-                        inserted.insert(x_name);
-                    }
+                    sent_whole.insert(name.clone());
                 } else {
-                    inserted.insert(name.clone());
                     for tab in tabs_of(b) {
                         cur.entry(Parent::Tab(tab)).or_default();
                     }
@@ -670,14 +686,13 @@ pub fn diff(old: &[Block], new: &[Block]) -> Option<Vec<PaneEdit>> {
                 }
             }
             // the lists inside it come next, unless it was sent whole
-            if is_layout(b) && !whole.contains(name.as_str()) && !(inserted.contains(name) && walk(b).len() > 1 && walk(b).into_iter().skip(1).all(|x| inserted.contains(x.name.as_deref().unwrap_or_default()))) {
-                match b.family.as_ref() {
-                    Some(Family::Layout(l)) => match l.kind.as_ref() {
+            if !whole.contains(name.as_str()) && !sent_whole.contains(name) {
+                if let Some(Family::Layout(l)) = b.family.as_ref() {
+                    match l.kind.as_ref() {
                         Some(layout::Kind::Stack(_)) => parents.push(Parent::Stack(name.clone())),
                         Some(layout::Kind::Tabs(t)) => parents.extend(t.tabs.iter().map(|t| Parent::Tab(t.id.clone()))),
                         None => {}
-                    },
-                    _ => {}
+                    }
                 }
             }
         }
@@ -723,7 +738,13 @@ fn tabs_of(b: &Block) -> Vec<String> {
     }
 }
 
-fn relocate(cur: &mut HashMap<Parent, Vec<String>>, loc: &mut HashMap<String, Parent>, name: &str, parent: &Parent, after: Option<&str>) {
+fn relocate(
+    cur: &mut HashMap<Parent, Vec<String>>,
+    loc: &mut HashMap<String, Parent>,
+    name: &str,
+    parent: &Parent,
+    after: Option<&str>,
+) {
     if let Some(from) = loc.get(name).cloned() {
         if let Some(list) = cur.get_mut(&from) {
             list.retain(|x| x != name);
@@ -773,14 +794,18 @@ pub fn board_diff(old: &Value, new: &Value) -> Option<Vec<PaneEdit>> {
         return None;
     }
     let mut edits = Vec::new();
-    let gone: Vec<String> = was.iter().map(|(id, _)| id.clone()).filter(|id| !now.iter().any(|(n, _)| n == id)).collect();
+    let gone: Vec<String> =
+        was.iter().map(|(id, _)| id.clone()).filter(|id| !now.iter().any(|(n, _)| n == id)).collect();
     if !gone.is_empty() {
         edits.push(remove_items(None, gone));
     }
     let put: Vec<pane_edit::Item> = now
         .iter()
         .filter(|(id, item)| was.iter().find(|(w, _)| w == id).is_none_or(|(_, before)| before != item))
-        .map(|(_, item)| pane_edit::Item { kind: Some(ItemKind::Board(Box::new(convert::to_struct(item)))), ..Default::default() })
+        .map(|(_, item)| pane_edit::Item {
+            kind: Some(ItemKind::Board(Box::new(convert::to_struct(item)))),
+            ..Default::default()
+        })
         .collect();
     if !put.is_empty() {
         edits.push(put_items(None, put));
@@ -800,7 +825,10 @@ pub fn remove(name: &str) -> PaneEdit {
 pub fn put_board_items(items: &[Value]) -> PaneEdit {
     let items = items
         .iter()
-        .map(|item| pane_edit::Item { kind: Some(ItemKind::Board(Box::new(convert::to_struct(item)))), ..Default::default() })
+        .map(|item| pane_edit::Item {
+            kind: Some(ItemKind::Board(Box::new(convert::to_struct(item)))),
+            ..Default::default()
+        })
         .collect();
     put_items(None, items)
 }

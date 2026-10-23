@@ -40,3 +40,7 @@ path = "examples/trim_descriptors.rs"
 buffa = "0.9.2"
 buffa-build = "0.9.2"
 buffa-descriptor = "0.9.2"
+
+[[example]]
+name = "video"
+path = "examples/video/main.rs"

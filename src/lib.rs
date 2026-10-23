@@ -55,6 +55,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+pub mod blocks;
 pub mod convert;
 pub mod edits;
 mod pane;
@@ -71,12 +72,12 @@ pub use types::pointman::extension::v1 as protocol;
 /// Blocks, pane content and edits, ids: `pointman.v1`.
 pub use types::pointman::v1;
 
-pub use pane::{Pane, Refused};
+pub use pane::{Pane, Refused, AUDIO_MAX, SEALING, VIDEO_FRAME_MAX};
 
 use protocol::{
     CheckpointRequest, CommandCancelRequest, CommandCancelResponse, CommandId, CommandStartRequest,
-    CommandStartResponse, DoneRequest, EventRequest, FailedRequest, InitializeRequest, InitializeResponse, OutputRequest,
-    ProgressRequest, SecretGetRequest, SecretListRequest, ShutdownResponse,
+    CommandStartResponse, DoneRequest, EventRequest, FailedRequest, InitializeRequest, InitializeResponse,
+    OutputRequest, ProgressRequest, SecretGetRequest, SecretListRequest, ShutdownResponse,
 };
 
 /// The protocol version this SDK speaks: `PROTOCOL_TYPED`, the messages in standard JSON.
@@ -186,8 +187,18 @@ type MethodFn = Arc<dyn Fn(Value) -> anyhow::Result<Value> + Send + Sync>;
 type HookFn = Arc<dyn Fn(&Handle) -> anyhow::Result<()> + Send + Sync>;
 
 /// What the SDK answers itself: an [`Extension::on`] can't take these.
-const OWN: [&str; 8] =
-    ["initialize", "shutdown", "command.start", "command.cancel", "pane.open", "pane.input", "pane.context", "pane.close"];
+const OWN: [&str; 10] = [
+    "initialize",
+    "shutdown",
+    "command.start",
+    "command.cancel",
+    "pane.open",
+    "pane.input",
+    "pane.context",
+    "pane.close",
+    "pane.viewers",
+    "pane.control",
+];
 
 // ------------------------------------------------------------------ talking to the node
 
@@ -286,7 +297,11 @@ impl Handle {
             return;
         }
         events.insert(name.to_string(), data.clone());
-        self.notify(&EventRequest { name: name.to_string(), data: convert::to_struct(&data).into(), ..Default::default() });
+        self.notify(&EventRequest {
+            name: name.to_string(),
+            data: convert::to_struct(&data).into(),
+            ..Default::default()
+        });
     }
 
     /// Ask the node something (`SecretListRequest`, `OauthLoadRequest`…), and wait up to 30 s for its answer.
@@ -442,7 +457,11 @@ impl Job {
     /// A checkpoint: given back as `job.checkpoint` if the command restarts.
     pub fn save(&self, state: impl Serialize) {
         let state = convert::to_proto(&to_json(state));
-        self.handle.notify(&CheckpointRequest { id: self.command_id().into(), state: state.into(), ..Default::default() });
+        self.handle.notify(&CheckpointRequest {
+            id: self.command_id().into(),
+            state: state.into(),
+            ..Default::default()
+        });
     }
 
     /// A file it made, for the node to publish: `kind` is an output kind (`video`, `image`…), `role` is
@@ -709,7 +728,10 @@ impl Extension {
             });
             return true;
         }
-        if matches!(method.as_str(), "pane.open" | "pane.input" | "pane.context" | "pane.close") {
+        if matches!(
+            method.as_str(),
+            "pane.open" | "pane.input" | "pane.context" | "pane.viewers" | "pane.control" | "pane.close"
+        ) {
             let opener = match method.as_str() {
                 "pane.open" => params["open"].as_str().and_then(|open| {
                     Some((self.openers.get(open)?.clone(), self.pane_formats.get(open).cloned().flatten()))
@@ -783,7 +805,11 @@ impl Extension {
         if !self.commands.contains_key(kind) {
             bail!("{kind} isn't a command of {}", self.handle.0.id);
         }
-        let cid = p.id.as_option().map(|id| id.value.clone()).filter(|id| !id.is_empty()).context("command.start has no id")?;
+        let cid =
+            p.id.as_option()
+                .map(|id| id.value.clone())
+                .filter(|id| !id.is_empty())
+                .context("command.start has no id")?;
         let mut jobs = lock(&self.jobs);
         if jobs.contains_key(&cid) {
             return Ok(to_json(CommandStartResponse { already: true, ..Default::default() }));
@@ -883,7 +909,11 @@ impl Extension {
             ..Default::default()
         };
         match outcome {
-            Ok(result) => h.notify(&DoneRequest { id: id.clone().into(), result: convert::to_proto(&result).into(), ..Default::default() }),
+            Ok(result) => h.notify(&DoneRequest {
+                id: id.clone().into(),
+                result: convert::to_proto(&result).into(),
+                ..Default::default()
+            }),
             Err(e) if caused_by::<Cancelled>(&e) => h.notify(&failed("cancelled".into(), false, true)),
             Err(e) if caused_by::<Retry>(&e) => h.notify(&failed(text_or(&e, "try again later"), true, false)),
             Err(e) => {

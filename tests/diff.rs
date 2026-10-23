@@ -17,20 +17,32 @@ fn text(name: &str, markdown: &str) -> Block {
 
 fn stack(name: &str, children: Vec<Block>) -> Block {
     let stack = layout::Stack { children, ..Default::default() };
-    named(name, Family::Layout(Box::new(Layout { kind: Some(layout::Kind::Stack(Box::new(stack))), ..Default::default() })))
+    named(
+        name,
+        Family::Layout(Box::new(Layout { kind: Some(layout::Kind::Stack(Box::new(stack))), ..Default::default() })),
+    )
 }
 
 fn tabs(name: &str, tabs: Vec<(&str, &str, Vec<Block>)>) -> Block {
     let tabs = tabs
         .into_iter()
-        .map(|(id, title, children)| layout::tabs::Tab { id: id.into(), title: title.into(), children, ..Default::default() })
+        .map(|(id, title, children)| layout::tabs::Tab {
+            id: id.into(),
+            title: title.into(),
+            children,
+            ..Default::default()
+        })
         .collect();
     let tabs = layout::Tabs { tabs, ..Default::default() };
-    named(name, Family::Layout(Box::new(Layout { kind: Some(layout::Kind::Tabs(Box::new(tabs))), ..Default::default() })))
+    named(
+        name,
+        Family::Layout(Box::new(Layout { kind: Some(layout::Kind::Tabs(Box::new(tabs))), ..Default::default() })),
+    )
 }
 
 fn items(name: &str, ids: &[(&str, &str)]) -> Block {
-    let items = ids.iter().map(|(id, title)| list::Item { id: (*id).into(), title: (*title).into(), ..Default::default() });
+    let items =
+        ids.iter().map(|(id, title)| list::Item { id: (*id).into(), title: (*title).into(), ..Default::default() });
     named(name, Family::List(Box::new(List { items: items.collect(), ..Default::default() })))
 }
 
@@ -137,7 +149,9 @@ fn which_tab_is_open_is_the_persons() {
 
 #[test]
 fn a_tab_titled_anew_sends_the_tabs_whole_and_a_block_in_a_tab_changes_by_name() {
-    let tabs_of = |title: &str, a: &str| tabs("t", vec![("one", title, vec![text("a", a)]), ("two", "Two", vec![items("l", &[("1", "x")])])]);
+    let tabs_of = |title: &str, a: &str| {
+        tabs("t", vec![("one", title, vec![text("a", a)]), ("two", "Two", vec![items("l", &[("1", "x")])])])
+    };
     assert_eq!(kinds(&edits_for(vec![tabs_of("One", "A")], vec![tabs_of("Uno", "A")])), ["replace"]);
     assert_eq!(kinds(&edits_for(vec![tabs_of("One", "A")], vec![tabs_of("One", "A!")])), ["replace"]);
 }
@@ -200,7 +214,8 @@ fn fresh(rng: &mut Rng, counter: &mut u32, depth: usize) -> Block {
         0 => text(&name, &format!("t{}", rng.below(3))),
         1 => {
             let n = rng.below(4);
-            let ids: Vec<(String, String)> = (0..n).map(|i| (format!("{name}.i{i}"), format!("v{}", rng.below(3)))).collect();
+            let ids: Vec<(String, String)> =
+                (0..n).map(|i| (format!("{name}.i{i}"), format!("v{}", rng.below(3)))).collect();
             let refs: Vec<(&str, &str)> = ids.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
             items(&name, &refs)
         }
@@ -219,7 +234,13 @@ fn fresh(rng: &mut Rng, counter: &mut u32, depth: usize) -> Block {
         _ => {
             let n = 1 + rng.below(2);
             let tabs_in: Vec<(String, String, Vec<Block>)> = (0..n)
-                .map(|i| (format!("{name}.tab{i}"), format!("Tab {}", rng.below(2)), (0..rng.below(3)).map(|_| fresh(rng, counter, depth + 1)).collect()))
+                .map(|i| {
+                    (
+                        format!("{name}.tab{i}"),
+                        format!("Tab {}", rng.below(2)),
+                        (0..rng.below(3)).map(|_| fresh(rng, counter, depth + 1)).collect(),
+                    )
+                })
                 .collect();
             let refs = tabs_in.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.clone())).collect();
             tabs(&name, refs)
@@ -259,7 +280,11 @@ fn mutate(rng: &mut Rng, counter: &mut u32, blocks: &mut Vec<Block>) {
             match list[at].family.as_mut() {
                 Some(Family::Text(t)) => t.markdown = format!("m{}", rng.below(5)),
                 Some(Family::List(l)) => match rng.below(4) {
-                    0 => l.items.push(list::Item { id: format!("{name}.n{counter}"), title: "new".into(), ..Default::default() }),
+                    0 => l.items.push(list::Item {
+                        id: format!("{name}.n{counter}"),
+                        title: "new".into(),
+                        ..Default::default()
+                    }),
                     1 if !l.items.is_empty() => drop(l.items.remove(rng.below(l.items.len()))),
                     2 if !l.items.is_empty() => {
                         let i = rng.below(l.items.len());
@@ -345,7 +370,11 @@ fn any_change_is_said_in_edits_that_make_it_or_is_sent_whole() {
                 sent += list.len();
                 let got = apply(&content(old.clone()), &list)
                     .unwrap_or_else(|e| panic!("round {round}: {e}\nold: {old:#?}\nnew: {new:#?}\nedits: {list:#?}"));
-                assert_eq!(without_selected(got.blocks), without_selected(new.clone()), "round {round}\nold: {old:#?}\nedits: {list:#?}");
+                assert_eq!(
+                    without_selected(got.blocks),
+                    without_selected(new.clone()),
+                    "round {round}\nold: {old:#?}\nedits: {list:#?}"
+                );
             }
             None => whole += 1,
         }

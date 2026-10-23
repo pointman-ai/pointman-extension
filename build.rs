@@ -16,12 +16,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", set.display());
     let bytes = std::fs::read(&set).expect("proto/descriptors.pb is in the package");
     let fds = FileDescriptorSet::decode_from_slice(&bytes).expect("proto/descriptors.pb is a FileDescriptorSet");
-    let files: Vec<String> = fds
-        .file
-        .iter()
-        .filter_map(|f| f.name.clone())
-        .filter(|n| n.starts_with("pointman/"))
-        .collect();
+    let files: Vec<String> =
+        fds.file.iter().filter_map(|f| f.name.clone()).filter(|n| n.starts_with("pointman/")).collect();
     assert!(files.iter().any(|f| f == PROTOCOL), "{PROTOCOL} isn't in {}", set.display());
     buffa_build::Config::new()
         .descriptor_set(&set)
@@ -80,10 +76,6 @@ fn methods(fds: &FileDescriptorSet) -> String {
             }
         }
     }
-    write!(
-        out,
-        "/// Every method of the protocol, both ways.\npub const METHODS: &[Info] = &[\n{table}];\n"
-    )
-    .unwrap();
+    write!(out, "/// Every method of the protocol, both ways.\npub const METHODS: &[Info] = &[\n{table}];\n").unwrap();
     out
 }
