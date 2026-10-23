@@ -1,0 +1,17 @@
+{
+  "method": "command.start",
+  "params": {
+    "id": {
+      "value": "req-412"
+    },
+    "kind": "resolve.render",
+    "params": {
+      "timeline": "Cut 3"
+    },
+    "work": "/w/resolve/req-412",
+    "checkpoint": {
+      "frame": 120.0
+    }
+  },
+  "result": {}
+}

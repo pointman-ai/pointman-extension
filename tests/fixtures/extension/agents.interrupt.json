@@ -1,0 +1,9 @@
+{
+  "method": "agents.interrupt",
+  "params": {
+    "live": {
+      "value": "run_6296"
+    }
+  },
+  "result": {}
+}

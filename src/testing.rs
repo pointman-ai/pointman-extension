@@ -41,7 +41,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::{guarded, id_text, load_manifest, lock, resolve, PROTOCOL};
+use crate::protocol::{
+    CheckpointRequest, CommandCancelRequest, CommandId, CommandStartRequest, DoneRequest, EventRequest, FailedRequest,
+    InitializeRequest, InitializeResponse, OutputRequest, PaneClosedRequest, PaneEditRequest, PaneInputRequest, PaneOpenRequest,
+    PaneOpenResponse, PaneSetRequest, PaneTitleRequest, PaneViewer, ProgressRequest, SecretGetRequest, SecretGetResponse,
+    SecretListRequest, SecretListResponse,
+};
+use crate::protocol::pane_open_response::First;
+use crate::v1::{Block, MachineId, MemberRef, PaneContent, PaneContext, PaneFormat, PaneId, PaneInput};
+use crate::{convert, edits, from_params, guarded, load_manifest, lock, resolve, id_text, Request, PROTOCOL};
 
 /// What a stand-in passes on from its own environment, as a node does: never the board's tokens.
 pub const ENV_KEEP: [&str; 7] = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "PYTHONUTF8"];
@@ -79,28 +87,13 @@ impl fmt::Display for Failed {
 
 impl std::error::Error for Failed {}
 
-/// A finished command: what it returned, and what it reported on the way.
+/// A finished command: what it returned, and what it reported on the way, as the messages it sent.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Done {
     pub result: Value,
-    pub progress: Vec<Progress>,
-    pub outputs: Vec<Output>,
+    pub progress: Vec<ProgressRequest>,
+    pub outputs: Vec<OutputRequest>,
     pub checkpoints: Vec<Value>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Progress {
-    pub fraction: Option<f64>,
-    pub stage: Option<String>,
-    pub detail: Value,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Output {
-    pub path: PathBuf,
-    pub kind: String,
-    pub role: String,
-    pub meta: Value,
 }
 
 /// How to run one command: `RunOptions { cid: Some("c1".into()), ..Default::default() }`.
@@ -119,21 +112,22 @@ impl Default for RunOptions {
     }
 }
 
-/// How to open one pane: `PaneOptions { context: json!({"thread": "thr_1"}), ..Default::default() }`.
+/// How to open one pane: `PaneOptions { context: PaneContext { item: Some("MB-1".into()), ..Default::default() }, ..Default::default() }`.
 #[derive(Debug, Clone)]
 pub struct PaneOptions {
     /// What the person is looking at.
-    pub context: Value,
-    /// Who: `{person, device}` (`james` on `test-device` when not given).
-    pub viewer: Value,
+    pub context: PaneContext,
+    /// Who it's for (`james` when not given).
+    pub viewer: PaneViewer,
     pub timeout: Duration,
 }
 
 impl Default for PaneOptions {
     fn default() -> Self {
+        let person = MemberRef { kind: Some(crate::v1::member_ref::Kind::Handle("james".into())), ..Default::default() };
         PaneOptions {
-            context: json!({}),
-            viewer: json!({"person": "james", "device": "test-device"}),
+            context: PaneContext::default(),
+            viewer: PaneViewer { person: person.into(), ..Default::default() },
             timeout: CALL_TIMEOUT,
         }
     }
@@ -215,8 +209,22 @@ impl StandIn {
         self.secrets([(name.into(), value.into())])
     }
 
-    /// Anything more it may ask the node (an mcp extension's `oauth.load`), answered by `f`. An
-    /// error goes back to the extension as the node's reason.
+    /// Anything more it may ask the node (an mcp extension's `oauth.load`), answered by `f` with the request and
+    /// the answer as their messages. An error goes back to the extension as the node's reason.
+    pub fn on<R, F>(mut self, f: F) -> Self
+    where
+        R: Request,
+        F: Fn(R) -> anyhow::Result<R::Response> + Send + Sync + 'static,
+    {
+        let f: MethodFn = Arc::new(move |params| {
+            let request: R = from_params(params, R::METHOD)?;
+            Ok(serde_json::to_value(f(request)?)?)
+        });
+        self.methods.insert(R::METHOD.to_string(), f);
+        self
+    }
+
+    /// The same by method name, with the params and the answer as JSON: for a fake that needn't be typed.
     pub fn method<F, R>(mut self, name: &str, f: F) -> Self
     where
         F: Fn(Value) -> anyhow::Result<R> + Send + Sync + 'static,
@@ -376,20 +384,27 @@ impl StandIn {
         });
 
         let roots: Vec<String> = self.roots.iter().map(|r| resolve(r).to_string_lossy().into_owned()).collect();
-        let hello = json!({
-            "protocol": PROTOCOL, "node": self.node, "machine": self.machine, "settings": self.settings,
-            "work_dir": work_dir, "state_dir": state_dir, "roots": roots,
-        });
-        let info = match shared.request("initialize", hello, Duration::from_secs(20)) {
+        let hello = InitializeRequest {
+            protocol: PROTOCOL.into(),
+            node: self.node.clone(),
+            machine: MachineId { value: self.machine.clone(), ..Default::default() }.into(),
+            settings: convert::to_struct(&self.settings).into(),
+            work_dir: work_dir.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            roots,
+            ..Default::default()
+        };
+        let info = match shared.request("initialize", serde_json::to_value(&hello).unwrap_or_default(), Duration::from_secs(20)) {
             Ok(info) => info,
             Err(e) => {
                 self.stop();
                 return Err(e);
             }
         };
-        if info["protocol"] != json!(PROTOCOL) {
+        let said: InitializeResponse = crate::from_json(info.clone()).unwrap_or_default();
+        if said.protocol.as_known() != Some(PROTOCOL) {
             self.stop();
-            return Err(Failed::new(format!("{} speaks protocol {}, nodes {PROTOCOL}", shared.id, info["protocol"])));
+            return Err(Failed::new(format!("{} speaks protocol {}, nodes {}", shared.id, info["protocol"], buffa::Enumeration::to_i32(&PROTOCOL))));
         }
         if let Some(live) = self.live.as_mut() {
             live.info = info;
@@ -438,10 +453,15 @@ impl StandIn {
         let (tx, rx) = mpsc::channel();
         lock(&s.runs).insert(cid.clone(), (Done::default(), tx));
         let params = if params.is_null() { json!({}) } else { params };
-        let start = json!({
-            "id": cid, "kind": kind, "params": params,
-            "work": live.work_dir.join(&cid), "checkpoint": options.checkpoint,
-        });
+        let start = CommandStartRequest {
+            id: CommandId { value: cid.clone(), ..Default::default() }.into(),
+            kind: kind.to_string(),
+            params: convert::to_struct(&params).into(),
+            work: live.work_dir.join(&cid).to_string_lossy().into_owned(),
+            checkpoint: options.checkpoint.as_ref().map(convert::to_proto).into(),
+            ..Default::default()
+        };
+        let start = serde_json::to_value(start).unwrap_or_default();
         if let Err(e) = s.request("command.start", start, CALL_TIMEOUT) {
             // it stopped before saying it had the command: its run's own end (done, or stopped) says more
             let ended = rx.try_recv().ok();
@@ -458,7 +478,9 @@ impl StandIn {
 
     /// Cancel a running command, by its id: `{"found": bool}`.
     pub fn cancel(&self, cid: &str) -> Result<Value, Failed> {
-        self.live()?.shared.request("command.cancel", json!({"id": cid}), CALL_TIMEOUT)
+        let id = CommandId { value: cid.to_string(), ..Default::default() };
+        let request = CommandCancelRequest { id: id.into(), ..Default::default() };
+        self.live()?.shared.request("command.cancel", serde_json::to_value(request).unwrap_or_default(), CALL_TIMEOUT)
     }
 
     /// Ask it one of its own methods (`ext.method`), as the node does, and wait up to 30 s.
@@ -471,11 +493,6 @@ impl StandIn {
         self.live()?.shared.request(method, params, timeout)
     }
 
-    /// New settings for this machine, as `settings.changed`.
-    pub fn change_settings(&self, settings: Value) -> Result<(), Failed> {
-        self.live()?.shared.request("settings.changed", json!({"settings": settings}), CALL_TIMEOUT).map(drop)
-    }
-
     /// Open one of its `[[panes]]`, as the node does for an app, and wait for its answer.
     pub fn open_pane(&self, open: &str, target: Value) -> Result<PaneView, Failed> {
         self.open_pane_with(open, target, PaneOptions::default())
@@ -486,10 +503,15 @@ impl StandIn {
         let pid = format!("pane_{}", s.ids.fetch_add(1, Ordering::SeqCst) + 1);
         let view = Arc::new(View { id: pid.clone(), state: Mutex::default(), changed: Condvar::new() });
         lock(&s.panes).insert(pid.clone(), view.clone());
-        let target = if target.is_null() { json!({}) } else { target };
-        let params = json!({
-            "pane": pid, "open": open, "target": target, "context": options.context, "viewer": options.viewer,
-        });
+        let params = serde_json::to_value(PaneOpenRequest {
+            pane: PaneId { value: pid.clone(), ..Default::default() }.into(),
+            open: open.to_string(),
+            target: convert::to_struct(&target).into(),
+            context: options.context.clone().into(),
+            viewer: options.viewer.clone().into(),
+            ..Default::default()
+        })
+        .unwrap_or_default();
         let opened = view.clone();
         let then: ThenFn = Box::new(move |answer: &Value| opened.took("opened", answer, false));
         if let Err(e) = s.request_then("pane.open", params, options.timeout, Some(then)) {
@@ -739,17 +761,23 @@ impl Shared {
         let reply: Result<Value, String> = if let Some(f) = self.methods.get(&method) {
             guarded(|| f(params)).map_err(|e| format!("{e:#}"))
         } else if method == "secret.list" {
-            let prefix = params["prefix"].as_str().unwrap_or_default();
-            let names: Vec<&String> =
-                self.secrets.keys().filter(|n| n.starts_with(prefix) && allows_secret(&self.allowed, n)).collect();
-            Ok(json!({"names": names}))
+            let prefix = crate::from_json::<SecretListRequest>(params).map(|r| r.prefix).unwrap_or_default();
+            let names: Vec<String> = self
+                .secrets
+                .keys()
+                .filter(|n| n.starts_with(&prefix) && allows_secret(&self.allowed, n))
+                .cloned()
+                .collect();
+            Ok(serde_json::to_value(SecretListResponse { names, ..Default::default() }).unwrap_or_default())
         } else if method == "secret.get" {
-            let name = params["name"].as_str().unwrap_or_default();
-            if !allows_secret(&self.allowed, name) {
+            let name = crate::from_json::<SecretGetRequest>(params).map(|r| r.name).unwrap_or_default();
+            if !allows_secret(&self.allowed, &name) {
                 Err(format!("{} may not use the secret '{name}': it isn't in its permissions", self.id))
             } else {
-                match self.secrets.get(name) {
-                    Some(value) => Ok(json!({"value": value})),
+                match self.secrets.get(&name) {
+                    Some(value) => {
+                        Ok(serde_json::to_value(SecretGetResponse { value: value.clone(), ..Default::default() }).unwrap_or_default())
+                    }
                     None => Err(format!("no secret '{name}' in the vault")),
                 }
             }
@@ -767,52 +795,42 @@ impl Shared {
         let method = msg["method"].as_str().unwrap_or_default();
         let p = &msg["params"];
         if method.starts_with("pane.") {
-            let view = lock(&self.panes).get(&p.get("pane").map(id_text).unwrap_or_default()).cloned();
+            let pane = p.get("pane").and_then(|pane| pane.get("value")).map(id_text).unwrap_or_default();
+            let view = lock(&self.panes).get(&pane).cloned();
             if let Some(view) = view {
                 view.took(method, p, true);
             }
             return;
         }
         if method == "event" {
-            let name = p["name"].as_str().unwrap_or_default();
-            if name.starts_with(&format!("{}.", self.id)) {
-                let data = match p.get("data") {
-                    None | Some(Value::Null) => json!({}),
-                    Some(data) => data.clone(),
-                };
-                lock(&self.events).insert(name.to_string(), data);
+            let Ok(event) = crate::from_json::<EventRequest>(p.clone()) else { return };
+            if event.name.starts_with(&format!("{}.", self.id)) {
+                lock(&self.events).insert(event.name, convert::from_struct(&event.data));
                 self.changed.notify_all();
             }
             return;
         }
-        let cid = p.get("id").map(id_text).unwrap_or_default();
+        let cid = p.get("id").and_then(|id| id.get("value")).map(id_text).unwrap_or_default();
         let mut runs = lock(&self.runs);
         let Some((record, _)) = runs.get_mut(&cid) else { return };
-        let text = |key: &str| p[key].as_str().map(String::from);
         match method {
-            "progress" => record.progress.push(Progress {
-                fraction: p["fraction"].as_f64(),
-                stage: text("stage"),
-                detail: p["detail"].clone(),
-            }),
-            "checkpoint" => record.checkpoints.push(p["state"].clone()),
-            "output" => record.outputs.push(Output {
-                path: PathBuf::from(text("path").unwrap_or_default()),
-                kind: text("kind").unwrap_or_default(),
-                role: text("role").unwrap_or_default(),
-                meta: p["meta"].clone(),
-            }),
+            "progress" => record.progress.extend(crate::from_json::<ProgressRequest>(p.clone()).ok()),
+            "checkpoint" => {
+                if let Ok(c) = crate::from_json::<CheckpointRequest>(p.clone()) {
+                    record.checkpoints.push(c.state.as_option().map(convert::from_proto).unwrap_or(Value::Null));
+                }
+            }
+            "output" => record.outputs.extend(crate::from_json::<OutputRequest>(p.clone()).ok()),
             "done" => {
-                if let Some((mut record, tx)) = runs.remove(&cid) {
-                    record.result = p["result"].clone();
+                if let (Some((mut record, tx)), Ok(done)) = (runs.remove(&cid), crate::from_json::<DoneRequest>(p.clone())) {
+                    record.result = done.result.as_option().map(convert::from_proto).unwrap_or(Value::Null);
                     let _ = tx.send(Ok(record));
                 }
             }
             "failed" => {
-                if let Some((_, tx)) = runs.remove(&cid) {
-                    let message = text("error").filter(|e| !e.is_empty()).unwrap_or_else(|| "failed".into());
-                    let flag = |key: &str| p[key].as_bool().unwrap_or(false);
-                    let _ = tx.send(Err(Failed { message, retry: flag("retry"), cancelled: flag("cancelled") }));
+                if let (Some((_, tx)), Ok(failed)) = (runs.remove(&cid), crate::from_json::<FailedRequest>(p.clone())) {
+                    let message = if failed.error.is_empty() { "failed".to_string() } else { failed.error };
+                    let _ = tx.send(Err(Failed { message, retry: failed.retry, cancelled: failed.cancelled }));
                 }
             }
             _ => {}
@@ -822,7 +840,7 @@ impl Shared {
 
 // ------------------------------------------------------------------ panes
 
-/// A pane as an app sees it: its content, with every set and patch applied, and its inputs.
+/// A pane as an app sees it: its content, with every set and edit applied, and its inputs.
 pub struct PaneView {
     shared: Arc<Shared>,
     view: Arc<View>,
@@ -837,9 +855,9 @@ struct View {
 #[derive(Default)]
 struct ViewState {
     opened: bool,
-    format: Option<String>,
+    format: Option<PaneFormat>,
     title: Option<String>,
-    content: Value,
+    content: PaneContent,
     path: Option<String>,
     closed: Option<String>,
     frames: Vec<(String, Value)>,
@@ -853,18 +871,34 @@ impl PaneView {
         &self.view.id
     }
 
-    /// `blocks`, `board` or `page`.
-    pub fn format(&self) -> Option<String> {
-        lock(&self.view.state).format.clone()
+    /// Blocks, board, page, video or call.
+    pub fn format(&self) -> Option<PaneFormat> {
+        lock(&self.view.state).format
+    }
+
+    /// Its format as a word: `blocks`, `board`, `page`, `video` or `call`.
+    pub fn format_word(&self) -> Option<&'static str> {
+        self.format().map(crate::pane::pane_format_word)
     }
 
     pub fn title(&self) -> Option<String> {
         lock(&self.view.state).title.clone()
     }
 
-    /// Its content now: the blocks (an array) or the board (an object); null for a page.
-    pub fn content(&self) -> Value {
+    /// Its content now: the blocks, or the board.
+    pub fn content(&self) -> PaneContent {
         lock(&self.view.state).content.clone()
+    }
+
+    /// A blocks pane's blocks now.
+    pub fn blocks(&self) -> Vec<Block> {
+        lock(&self.view.state).content.blocks.clone()
+    }
+
+    /// A board pane's board now, as JSON (null for another pane).
+    pub fn board(&self) -> Value {
+        let state = lock(&self.view.state);
+        state.content.board.as_option().map(convert::from_struct).unwrap_or(Value::Null)
     }
 
     /// A page's path.
@@ -872,17 +906,14 @@ impl PaneView {
         lock(&self.view.state).path.clone()
     }
 
-    /// The block with this id, anywhere in the tree.
-    pub fn block(&self, id: &str) -> Option<Value> {
-        let state = lock(&self.view.state);
-        let at = state.content.as_array().and_then(|blocks| find_block(blocks, id))?;
-        get(&state.content, &at).cloned()
+    /// The block with this name, anywhere in the tree.
+    pub fn block(&self, name: &str) -> Option<Block> {
+        edits::find(&lock(&self.view.state).content.blocks, name).cloned()
     }
 
-    /// The board's item with this id.
+    /// The board's item with this id, as JSON.
     pub fn item(&self, id: &str) -> Option<Value> {
-        let state = lock(&self.view.state);
-        state.content["items"].as_array()?.iter().find(|item| item["id"] == id).cloned()
+        self.board()["items"].as_array()?.iter().find(|item| item["id"] == id).cloned()
     }
 
     /// Why it closed, once it has.
@@ -895,29 +926,49 @@ impl PaneView {
         lock(&self.view.state).frames.clone()
     }
 
-    /// What the node would have refused, and why: a patch that doesn't apply, a set over 1 MiB, a
-    /// block with no id or type, or an id used twice.
+    /// What the node would have refused, and why: edits that don't apply (all or none), a set over 1 MiB, a
+    /// block with no name or a family, or a name used twice.
     pub fn problems(&self) -> Vec<String> {
         lock(&self.view.state).problems.clone()
     }
 
-    /// Send an input, as the app does (`json!({"kind": "tap", "block": "plus"})`, `{"kind": "move",
-    /// "item": …, "to": …}`), and wait for the extension's answer: its patch is applied by then. A
+    /// Send an input, as the app does, and wait for the extension's answer: its edits are applied by then. A
     /// refusal is a [`Failed`] whose message is the extension's reason.
-    pub fn input(&self, event: Value) -> Result<(), Failed> {
-        self.shared.request("pane.input", json!({"pane": self.view.id, "event": event}), CALL_TIMEOUT).map(drop)
+    pub fn input(&self, event: PaneInput) -> Result<(), Failed> {
+        let request = PaneInputRequest {
+            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            event: event.into(),
+            ..Default::default()
+        };
+        self.shared.request("pane.input", serde_json::to_value(request).unwrap_or_default(), CALL_TIMEOUT).map(drop)
+    }
+
+    /// The same with the kind and fields as JSON: `input_json(json!({"kind": "tap", "block": "plus"}))`, `{"kind":
+    /// "move", "item": …, "to": …}`.
+    pub fn input_json(&self, event: Value) -> Result<(), Failed> {
+        let mut fields = event.as_object().cloned().unwrap_or_default();
+        let kind = fields.remove("kind").and_then(|k| k.as_str().map(String::from)).unwrap_or_default();
+        self.input(PaneInput::new(&kind, Value::Object(fields)))
     }
 
     /// What the person is looking at changed: `pane.context`.
-    pub fn look_at(&self, context: Value) -> Result<(), Failed> {
-        self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.context",
-                                 "params": {"pane": self.view.id, "context": context}}))
+    pub fn look_at(&self, context: PaneContext) -> Result<(), Failed> {
+        let request = crate::protocol::PaneContextRequest {
+            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            context: context.into(),
+            ..Default::default()
+        };
+        self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.context", "params": request}))
     }
 
     /// Close it from the node's side, as core does when the app goes.
     pub fn close(&self, reason: &str) -> Result<(), Failed> {
-        let params = json!({"pane": self.view.id, "reason": reason});
-        self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.close", "params": params}))?;
+        let request = crate::protocol::PaneCloseRequest {
+            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            reason: reason.to_string(),
+            ..Default::default()
+        };
+        self.shared.send(&json!({"jsonrpc": "2.0", "method": "pane.close", "params": request}))?;
         self.view.took("closed", &json!({"reason": reason}), false);
         Ok(())
     }
@@ -933,11 +984,11 @@ impl PaneView {
             let state = lock(&self.view.state);
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() || self.shared.gone.load(Ordering::SeqCst) {
+                let content = serde_json::to_string(&state.content).unwrap_or_default();
                 return Err(Failed::new(format!(
-                    "pane {} didn't get there in {:.1} s: {}",
+                    "pane {} didn't get there in {:.1} s: {content}",
                     self.view.id,
-                    timeout.as_secs_f64(),
-                    state.content
+                    timeout.as_secs_f64()
                 )));
             }
             if state.changes == seen {
@@ -959,39 +1010,54 @@ impl View {
             // in flight as it closed: the node drops it
         } else {
             match method {
-                "opened" => {
-                    state.opened = true;
-                    state.format = p["format"].as_str().map(String::from);
-                    state.title = p["title"].as_str().map(String::from);
-                    state.path = p["path"].as_str().map(String::from);
-                    let content = content_of(&state, p);
-                    let problems = set_problems(state.format.as_deref(), &content);
-                    state.problems.extend(problems);
-                    state.content = content;
-                }
-                "pane.set" => {
-                    let content = content_of(&state, p);
-                    let problems = set_problems(state.format.as_deref(), &content);
-                    if problems.is_empty() {
-                        state.content = content;
+                "opened" => match crate::from_json::<PaneOpenResponse>(p.clone()) {
+                    Ok(answer) => {
+                        state.opened = true;
+                        state.format = answer.format.as_known();
+                        state.title = answer.title.clone();
+                        match answer.first {
+                            Some(First::Content(content)) => {
+                                let problems = set_problems(state.format, &content);
+                                state.problems.extend(problems);
+                                state.content = *content;
+                            }
+                            Some(First::Page(page)) => state.path = Some(page.path),
+                            _ => {}
+                        }
                     }
-                    state.problems.extend(problems);
-                }
-                "pane.patch" => match apply_patch(&state.content, &p["patch"]) {
-                    Ok(content) => {
-                        let problems = match state.format.as_deref() {
-                            Some("blocks") => block_problems(&content),
-                            Some("board") => board_problems(&content),
-                            _ => Vec::new(),
-                        };
-                        state.problems.extend(problems);
-                        state.content = content;
-                    }
-                    Err(e) => state.problems.push(format!("patch: {e}")),
+                    Err(e) => state.problems.push(format!("the answer to pane.open isn't its message: {e}")),
                 },
-                "pane.title" => state.title = p["title"].as_str().map(String::from),
+                "pane.set" => match crate::from_json::<PaneSetRequest>(p.clone()) {
+                    Ok(set) => {
+                        let content = set.content.into_option().unwrap_or_default();
+                        let problems = set_problems(state.format, &content);
+                        if problems.is_empty() {
+                            state.content = content;
+                        }
+                        state.problems.extend(problems);
+                    }
+                    Err(e) => state.problems.push(format!("pane.set isn't its message: {e}")),
+                },
+                "pane.edit" => match crate::from_json::<PaneEditRequest>(p.clone()) {
+                    Ok(request) => match edits::apply(&state.content, &request.edits) {
+                        Ok(content) => {
+                            let problems = block_problems(&content.blocks);
+                            state.problems.extend(problems);
+                            state.content = content;
+                        }
+                        Err(e) => state.problems.push(format!("edits: {e}")),
+                    },
+                    Err(e) => state.problems.push(format!("pane.edit isn't its message: {e}")),
+                },
+                "pane.title" => {
+                    state.title = crate::from_json::<PaneTitleRequest>(p.clone()).ok().map(|t| t.title);
+                }
                 "pane.closed" | "closed" => {
-                    state.closed = Some(p["reason"].as_str().filter(|r| !r.is_empty()).unwrap_or("closed").to_string())
+                    let reason = match method {
+                        "closed" => p["reason"].as_str().map(String::from),
+                        _ => crate::from_json::<PaneClosedRequest>(p.clone()).ok().map(|c| c.reason),
+                    };
+                    state.closed = Some(reason.filter(|r| !r.is_empty()).unwrap_or_else(|| "closed".into()))
                 }
                 _ => {}
             }
@@ -1001,27 +1067,16 @@ impl View {
     }
 }
 
-fn content_of(state: &ViewState, p: &Value) -> Value {
-    match state.format.as_deref() {
-        Some("blocks") => p["blocks"].clone(),
-        Some("board") => p["board"].clone(),
-        _ => Value::Null,
-    }
-}
-
-fn set_problems(format: Option<&str>, content: &Value) -> Vec<String> {
+fn set_problems(format: Option<PaneFormat>, content: &PaneContent) -> Vec<String> {
     let mut problems = Vec::new();
-    if format == Some("page") {
-        return problems;
-    }
     let size = serde_json::to_vec(content).map(|b| b.len()).unwrap_or(0);
     if size > FRAME_MAX {
         problems.push(format!("a set of {size} bytes is over the 1 MiB a frame"));
     }
-    if format == Some("blocks") {
-        problems.extend(block_problems(content));
+    if format == Some(PaneFormat::PANE_FORMAT_BOARD) {
+        problems.extend(board_problems(&content.board.as_option().map(convert::from_struct).unwrap_or(Value::Null)));
     } else {
-        problems.extend(board_problems(content));
+        problems.extend(block_problems(&content.blocks));
     }
     problems
 }
@@ -1064,171 +1119,29 @@ pub fn board_problems(board: &Value) -> Vec<String> {
     problems
 }
 
-/// The little a stand-in checks: each block has a type and an id, unique in the pane.
-pub fn block_problems(blocks: &Value) -> Vec<String> {
-    fn walk(items: &[Value], at: &str, seen: &mut Vec<String>, problems: &mut Vec<String>) {
+/// The little a stand-in checks: each block has a name, unique in the pane, and a family.
+pub fn block_problems(blocks: &[Block]) -> Vec<String> {
+    fn walk(items: &[Block], at: &str, seen: &mut Vec<String>, problems: &mut Vec<String>) {
         for (i, b) in items.iter().enumerate() {
             let here = format!("{at}[{i}]");
-            let Some(kind) = b["type"].as_str().filter(|t| !t.is_empty()) else {
-                problems.push(format!("{here} has no type"));
-                continue;
-            };
-            match b["id"].as_str().filter(|id| !id.is_empty()) {
-                None => problems.push(format!("{here} ({kind}) has no id")),
-                Some(id) if seen.iter().any(|s| s == id) => {
-                    problems.push(format!("{here}: the id '{id}' is used twice"))
-                }
-                Some(id) => seen.push(id.to_string()),
+            if b.family.is_none() {
+                problems.push(format!("{here} has no family (text, chart, list…)"));
             }
-            if let Some(children) = b["children"].as_array() {
-                walk(children, &format!("{here}.children"), seen, problems);
-            }
-            for (t, tab) in b["tabs"].as_array().into_iter().flatten().enumerate() {
-                if let Some(children) = tab["children"].as_array() {
-                    walk(children, &format!("{here}.tabs[{t}].children"), seen, problems);
+            match b.name.as_deref().filter(|n| !n.is_empty()) {
+                None => problems.push(format!("{here} has no name")),
+                Some(name) if seen.iter().any(|s| s == name) => {
+                    problems.push(format!("{here}: the name '{name}' is used twice"))
                 }
+                Some(name) => seen.push(name.to_string()),
+            }
+            for (k, kids) in edits::children(b).into_iter().enumerate() {
+                walk(kids, &format!("{here}.children{k}"), seen, problems);
             }
         }
     }
-    let Some(blocks) = blocks.as_array() else { return vec!["blocks must be an array".into()] };
     let (mut seen, mut problems) = (Vec::new(), Vec::new());
     walk(blocks, "blocks", &mut seen, &mut problems);
     problems
-}
-
-/// A pane's patch, as the node applies it: RFC 6902's add, replace and remove (a patch with any other
-/// op is dropped whole). The content with every operation applied, or why it can't be. Paths go
-/// through ids, `/b/<block id>/…` or `/i/<item id>/…`, and `/b/<id>` alone is the block itself:
-/// replace swaps it, remove takes it out, add puts one before it.
-pub fn apply_patch(content: &Value, ops: &Value) -> Result<Value, String> {
-    let mut out = content.clone();
-    for op in ops.as_array().into_iter().flatten() {
-        let path = op["path"].as_str().unwrap_or_default();
-        match op["op"].as_str().unwrap_or_default() {
-            "add" => add(&mut out, path, op["value"].clone())?,
-            "remove" => drop(remove(&mut out, path)?),
-            "replace" => {
-                let at = locate(&out, path)?;
-                let there = get_mut(&mut out, &at).ok_or_else(|| nothing(path, at.last()))?;
-                *there = op["value"].clone();
-            }
-            other => {
-                return Err(format!(
-                    "'{other}' isn't one of add, replace and remove, which is all a pane's patch takes"
-                ))
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// A patch path as plain tokens from the content's root, through the block or item it names, or a plain
-/// pointer from the top of the content as a set sends it (`/blocks/…`, `/board/…`).
-fn locate(content: &Value, path: &str) -> Result<Vec<String>, String> {
-    let tokens: Vec<String> = match path.strip_prefix('/') {
-        Some(rest) => rest.split('/').map(|t| t.replace("~1", "/").replace("~0", "~")).collect(),
-        None => Vec::new(),
-    };
-    let top = if content.is_array() { "blocks" } else { "board" };
-    if tokens.len() >= 2 && tokens[0] == top {
-        return Ok(tokens[1..].to_vec());
-    }
-    if tokens.len() < 2 || (tokens[0] != "b" && tokens[0] != "i") {
-        return Err(format!(
-            "'{path}': a pane's patch paths start /b/<block id> or /i/<item id>, or /{top}/ from the top"
-        ));
-    }
-    let base = if tokens[0] == "b" {
-        content.as_array().and_then(|blocks| find_block(blocks, &tokens[1]))
-    } else {
-        content["items"]
-            .as_array()
-            .and_then(|items| items.iter().position(|item| item["id"] == tokens[1].as_str()))
-            .map(|i| vec!["items".to_string(), i.to_string()])
-    };
-    let what = if tokens[0] == "b" { "block" } else { "item" };
-    let mut at = base.ok_or_else(|| format!("'{path}': no {what} '{}'", tokens[1]))?;
-    at.extend(tokens[2..].iter().cloned());
-    Ok(at)
-}
-
-fn find_block(blocks: &[Value], id: &str) -> Option<Vec<String>> {
-    for (i, block) in blocks.iter().enumerate() {
-        if block["id"] == id {
-            return Some(vec![i.to_string()]);
-        }
-        let mut lists: Vec<(Vec<String>, &Vec<Value>)> = Vec::new();
-        if let Some(children) = block["children"].as_array() {
-            lists.push((vec![i.to_string(), "children".into()], children));
-        }
-        for (t, tab) in block["tabs"].as_array().into_iter().flatten().enumerate() {
-            if let Some(children) = tab["children"].as_array() {
-                lists.push((vec![i.to_string(), "tabs".into(), t.to_string(), "children".into()], children));
-            }
-        }
-        for (mut at, children) in lists {
-            if let Some(rest) = find_block(children, id) {
-                at.extend(rest);
-                return Some(at);
-            }
-        }
-    }
-    None
-}
-
-fn get<'a>(v: &'a Value, at: &[String]) -> Option<&'a Value> {
-    at.iter().try_fold(v, |v, token| match v {
-        Value::Object(map) => map.get(token),
-        Value::Array(items) => items.get(token.parse::<usize>().ok()?),
-        _ => None,
-    })
-}
-
-fn get_mut<'a>(v: &'a mut Value, at: &[String]) -> Option<&'a mut Value> {
-    at.iter().try_fold(v, |v, token| match v {
-        Value::Object(map) => map.get_mut(token),
-        Value::Array(items) => items.get_mut(token.parse::<usize>().ok()?),
-        _ => None,
-    })
-}
-
-fn nothing(path: &str, key: Option<&String>) -> String {
-    format!("'{path}': nothing at '{}'", key.map(String::as_str).unwrap_or_default())
-}
-
-fn add(content: &mut Value, path: &str, value: Value) -> Result<(), String> {
-    let at = locate(content, path)?;
-    let (key, parent) = at.split_last().ok_or_else(|| nothing(path, None))?;
-    let parent = get_mut(content, parent).ok_or_else(|| nothing(path, parent.last()))?;
-    match parent {
-        Value::Object(map) => {
-            map.insert(key.clone(), value);
-        }
-        Value::Array(items) if key == "-" => items.push(value),
-        Value::Array(items) => {
-            let i: usize = key.parse().map_err(|_| format!("'{path}': '{key}' isn't an index"))?;
-            if i > items.len() {
-                return Err(format!("'{path}': {i} is past the end"));
-            }
-            items.insert(i, value);
-        }
-        _ => {
-            return Err(format!("'{path}': can't add inside a {}", if parent.is_string() { "string" } else { "value" }))
-        }
-    }
-    Ok(())
-}
-
-fn remove(content: &mut Value, path: &str) -> Result<Value, String> {
-    let at = locate(content, path)?;
-    let (key, parent) = at.split_last().ok_or_else(|| nothing(path, None))?;
-    let parent = get_mut(content, parent).ok_or_else(|| nothing(path, parent.last()))?;
-    let removed = match parent {
-        Value::Object(map) => map.remove(key),
-        Value::Array(items) => key.parse::<usize>().ok().filter(|i| *i < items.len()).map(|i| items.remove(i)),
-        _ => None,
-    };
-    removed.ok_or_else(|| nothing(path, Some(key)))
 }
 
 fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
@@ -1242,61 +1155,15 @@ fn temp_dir(id: &str) -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allows_secret, apply_patch, block_problems, board_problems};
-    use crate::pointer;
-    use serde_json::{json, Value};
+    use super::{allows_secret, block_problems, board_problems};
+    use crate::v1::{block::Family, layout, Block, Layout, Text};
+    use serde_json::json;
 
-    #[test]
-    fn patches_go_through_ids() {
-        let blocks = json!([
-            {"type": "tabs", "id": "t", "tabs": [
-                {"id": "one", "title": "One", "children": [{"type": "list", "id": "a/b", "items": []}]}]},
-            {"type": "text", "id": "x", "markdown": "hi"}]);
-        let out = apply_patch(
-            &blocks,
-            &json!([
-                {"op": "add", "path": pointer(["b", "a/b", "items", "-"]), "value": {"id": "r1", "title": "Row"}},
-                {"op": "add", "path": "/b/a~1b/items/0", "value": {"id": "r0", "title": "First"}},
-                {"op": "add", "path": "/b/a~1b/note", "value": "hi"},
-                {"op": "replace", "path": "/b/x/markdown", "value": "bye"},
-                {"op": "remove", "path": "/b/t/tabs/0/children/0/items/1"},
-            ]),
-        )
-        .unwrap();
-        let inner = &out[0]["tabs"][0]["children"][0];
-        assert_eq!(inner["items"], json!([{"id": "r0", "title": "First"}]));
-        assert_eq!(inner["note"], "hi");
-        assert_eq!(out[1], json!({"type": "text", "id": "x", "markdown": "bye"}));
-        // /b/<id> alone is the block: remove takes it out, replace swaps it, add puts one before it
-        assert_eq!(apply_patch(&blocks, &json!([{"op": "remove", "path": "/b/x"}])).unwrap(), json!([blocks[0]]));
-        let swapped =
-            apply_patch(&blocks, &json!([{"op": "replace", "path": "/b/x", "value": {"type": "text", "id": "z"}}]));
-        assert_eq!(swapped.unwrap()[1]["id"], "z");
-        let before =
-            apply_patch(&blocks, &json!([{"op": "add", "path": "/b/x", "value": {"type": "text", "id": "w"}}]));
-        let ids: Vec<Value> = before.unwrap().as_array().unwrap().iter().map(|b| b["id"].clone()).collect();
-        assert_eq!(ids, [json!("t"), json!("w"), json!("x")]);
-        let board = json!({"items": [{"id": "i1", "state": "Todo"}]});
-        let moved = apply_patch(&board, &json!([{"op": "replace", "path": "/i/i1/state", "value": "Done"}])).unwrap();
-        assert_eq!(moved["items"][0]["state"], "Done");
-        // plain pointers from the top of the content, as a set sends it: {"blocks": […]} or {"board": {…}}
-        let grown =
-            apply_patch(&board, &json!([{"op": "add", "path": "/board/items/-", "value": {"id": "i2"}}])).unwrap();
-        assert_eq!(grown["items"][1]["id"], "i2");
-        let more =
-            apply_patch(&blocks, &json!([{"op": "add", "path": "/blocks/-", "value": {"type": "text", "id": "y"}}]));
-        assert_eq!(more.unwrap()[2]["id"], "y");
-        assert!(apply_patch(&blocks, &json!([{"op": "add", "path": "/board/items/-", "value": {}}])).is_err());
-        for (bad, why) in [
-            (json!({"op": "replace", "path": "/0/markdown", "value": 1}), "start /b/<block id>"),
-            (json!({"op": "replace", "path": "/b/nope/x", "value": 1}), "no block 'nope'"),
-            (json!({"op": "replace", "path": "/b/x/tone", "value": 1}), "nothing at 'tone'"),
-            (json!({"op": "add", "path": "/b/a~1b/items/5", "value": 1}), "past the end"),
-            (json!({"op": "move", "from": "/b/x/markdown", "path": "/b/x/text"}), "isn't one of add"),
-            (json!({"op": "test", "path": "/b/x/markdown", "value": "hi"}), "isn't one of add"),
-        ] {
-            let e = apply_patch(&blocks, &json!([bad])).unwrap_err();
-            assert!(e.contains(why), "{e}");
+    fn text(name: Option<&str>) -> Block {
+        Block {
+            name: name.map(String::from),
+            family: Some(Family::Text(Box::new(Text::default()))),
+            ..Default::default()
         }
     }
 
@@ -1314,15 +1181,24 @@ mod tests {
     }
 
     #[test]
-    fn blocks_need_a_type_and_an_id_once() {
-        let blocks = json!([{"type": "text", "id": "a"}, {"type": "stack", "id": "s", "children": [
-            {"type": "text", "id": "a"}, {"id": "n"}, {"type": "stat"}]}]);
+    fn blocks_need_a_name_once_and_a_family() {
+        let stack = Block {
+            name: Some("s".into()),
+            family: Some(Family::Layout(Box::new(Layout {
+                kind: Some(layout::Kind::Stack(Box::new(layout::Stack {
+                    children: vec![text(Some("a")), text(None), Block { name: Some("n".into()), ..Default::default() }],
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
         assert_eq!(
-            block_problems(&blocks),
+            block_problems(&[text(Some("a")), stack]),
             [
-                "blocks[1].children[0]: the id 'a' is used twice",
-                "blocks[1].children[1] has no type",
-                "blocks[1].children[2] (stat) has no id",
+                "blocks[1].children0[0]: the name 'a' is used twice",
+                "blocks[1].children0[1] has no name",
+                "blocks[1].children0[2] has no family (text, chart, list…)",
             ]
         );
     }

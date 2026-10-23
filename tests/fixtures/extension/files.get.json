@@ -1,0 +1,18 @@
+{
+  "method": "files.get",
+  "params": {
+    "path": "impacts/cve-2026-1.json",
+    "version": 3
+  },
+  "result": {
+    "file": {
+      "path": "impacts/cve-2026-1.json",
+      "version": 3,
+      "updatedAt": "2026-10-23T09:00:00Z",
+      "by": {
+        "value": "nixos"
+      },
+      "text": "{}"
+    }
+  }
+}

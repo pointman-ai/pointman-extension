@@ -1,0 +1,11 @@
+{
+  "method": "files.put",
+  "params": {
+    "path": "impacts/cve-2026-1.json",
+    "text": "{}"
+  },
+  "result": {
+    "path": "impacts/cve-2026-1.json",
+    "version": 3
+  }
+}

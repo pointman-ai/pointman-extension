@@ -1,0 +1,8 @@
+{
+  "method": "pane.flush",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    }
+  }
+}

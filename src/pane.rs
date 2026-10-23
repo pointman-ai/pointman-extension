@@ -1,27 +1,34 @@
 //! Panes (Pointman's docs/dev/panes.md): an extension answers `pane.open` for one of its manifest's
-//! `[[panes]]` with the first content, then keeps it current with `pane.set` and `pane.patch`. The
+//! `[[panes]]` with the first content, then keeps it current with `pane.set` and `pane.edit`. The
 //! twin of the Python SDK's `Pane`, message for message.
 //!
 //! ```no_run
-//! use pointman_extension::{Extension, Pane, Refused};
-//! use serde_json::{json, Value};
+//! use pointman_extension::v1::{block::Family, Block, Text};
+//! use pointman_extension::{protocol::PaneOpenResponse, Extension, Pane, Refused};
+//! use pointman_extension::v1::PaneInput;
 //! use std::sync::atomic::{AtomicU64, Ordering};
+//!
+//! fn text(name: &str, markdown: String) -> Block {
+//!     Block {
+//!         name: Some(name.into()),
+//!         family: Some(Family::Text(Box::new(Text { markdown, ..Default::default() }))),
+//!         ..Default::default()
+//!     }
+//! }
 //!
 //! # fn main() -> anyhow::Result<()> {
 //! let mut ext = Extension::new()?;
 //! ext.pane("counter", |pane: &Pane| {
 //!     let n = AtomicU64::new(0);
-//!     pane.on_input(move |pane: &Pane, event: &Value| -> anyhow::Result<()> {
-//!         if event["block"] != "plus" {
+//!     pane.on_input(move |pane: &Pane, event: &PaneInput| -> anyhow::Result<()> {
+//!         if event.str("block") != Some("plus") {
 //!             return Err(Refused::new("only + works").into());
 //!         }
 //!         let n = n.fetch_add(1, Ordering::SeqCst) + 1;
-//!         pane.update("count", json!({"value": n})); // a patch: /b/count/value
+//!         pane.show(vec![text("count", format!("Taps: {n}"))]); // an edit: replace "count"
 //!         Ok(())
 //!     });
-//!     Ok(json!({"title": "Counter", "blocks": [
-//!         {"type": "stat", "id": "count", "label": "Taps", "value": 0},
-//!         {"type": "actions", "id": "plus", "buttons": [{"id": "plus", "title": "+"}]}]}))
+//!     Ok(PaneOpenResponse::blocks(vec![text("count", "Taps: 0".into())]).titled("Counter"))
 //! });
 //! ext.run()
 //! # }
@@ -29,17 +36,24 @@
 //!
 //! Each pane's open, inputs, context and close run in order on a thread of its own. To keep a pane
 //! current, [`Pane::show`] (or [`Pane::show_board`]) takes all of its content each time and sends only
-//! what changed, as patches by id, so the apps animate rows and numbers in place.
+//! what changed, as edits by block name and item id ([`edits::diff`]), so the apps animate rows and numbers
+//! in place.
 
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::bail;
-use serde::Serialize;
-use serde_json::{json, Map, Value};
+use buffa_types::google::protobuf::Struct;
+use serde_json::{json, Value};
 
-use crate::{caused_by, guarded, id_text, lock, read, spawn, text_or, to_json, write, Handle, Outcome};
+use crate::protocol::{
+    pane_open_response::{First, Page},
+    PaneCloseRequest, PaneClosedRequest, PaneContextRequest, PaneEditRequest, PaneInputRequest, PaneInputResponse,
+    PaneOpenRequest, PaneOpenResponse, PaneSetRequest, PaneTitleRequest, PaneViewer,
+};
+use crate::v1::{Block, PaneContent, PaneContext, PaneEdit, PaneFormat, PaneId, PaneInput};
+use crate::{caused_by, convert, edits, from_params, guarded, lock, read, spawn, text_or, to_json, write, Handle, Notification, Outcome};
 
 /// Turn down a pane's input: the app undoes what it showed early (a card snaps back) and shows
 /// why. `return Err(Refused::new("Linear decides when parents close").into())`.
@@ -60,31 +74,67 @@ impl fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// A patch path from its parts, each escaped (RFC 6901): `pointer(["b", "files", "2"])` is
-/// `/b/files/2`.
-pub fn pointer<I, T>(parts: I) -> String
-where
-    I: IntoIterator<Item = T>,
-    T: fmt::Display,
-{
-    parts.into_iter().map(|part| format!("/{}", part.to_string().replace('~', "~0").replace('/', "~1"))).collect()
+impl PaneInput {
+    /// An input of this kind (`tap`, `move`…) with these fields (a JSON object).
+    pub fn new(kind: &str, fields: Value) -> Self {
+        PaneInput { kind: kind.to_string(), fields: convert::to_struct(&fields).into(), ..Default::default() }
+    }
+
+    /// Its fields, as a JSON object: `event.json()["block"]`.
+    pub fn json(&self) -> Value {
+        convert::from_struct(&self.fields)
+    }
+
+    /// One of its fields, if it's a string (`block`, `item`, `to`).
+    pub fn str(&self, field: &str) -> Option<&str> {
+        self.fields.as_option()?.fields.get(field)?.as_str()
+    }
 }
 
-pub(crate) type OpenFn = Arc<dyn Fn(&Pane) -> anyhow::Result<Value> + Send + Sync>;
-type InputFn = Arc<dyn Fn(&Pane, &Value) -> anyhow::Result<()> + Send + Sync>;
+impl PaneOpenResponse {
+    /// A blocks pane's first content.
+    pub fn blocks(blocks: Vec<Block>) -> Self {
+        PaneOpenResponse::content(PaneContent { blocks, ..Default::default() })
+    }
+
+    /// A board pane's first content: its project, states and items as the extension's tracker gives them.
+    pub fn board(board: &Value) -> Self {
+        PaneOpenResponse::content(PaneContent { board: convert::to_struct(board).into(), ..Default::default() })
+    }
+
+    /// A page pane's first file, in the extension's package.
+    pub fn page(path: &str) -> Self {
+        let page = Page { path: path.to_string(), ..Default::default() };
+        PaneOpenResponse { first: Some(First::Page(Box::new(page))), ..Default::default() }
+    }
+
+    fn content(content: PaneContent) -> Self {
+        PaneOpenResponse { first: Some(First::Content(Box::new(content))), ..Default::default() }
+    }
+
+    /// With a title; unset, an earlier title, else the manifest's.
+    pub fn titled(mut self, title: &str) -> Self {
+        self.title = Some(title.to_string());
+        self
+    }
+}
+
+pub(crate) type OpenFn = Arc<dyn Fn(&Pane) -> anyhow::Result<PaneOpenResponse> + Send + Sync>;
+type InputFn = Arc<dyn Fn(&Pane, &PaneInput) -> anyhow::Result<()> + Send + Sync>;
+type ContextFn = Arc<dyn Fn(&Pane, &PaneContext) -> anyhow::Result<()> + Send + Sync>;
 type CloseFn = Arc<dyn Fn(&Pane, &str) -> anyhow::Result<()> + Send + Sync>;
 
 enum Message {
-    Input(Value, Option<Value>),
-    Context(Value),
+    Input(PaneInput, Option<Value>),
+    Context(PaneContext),
     Close(String),
 }
 
 /// What the apps have, as far as [`Pane::show`] knows: nothing sent yet, the content after what was
-/// sent, or unknown after a hand-made patch (the next show sends all of it).
+/// sent, or unknown after edits it couldn't follow (the next show sends all of it).
 enum Last {
     Unset,
-    Known(Value),
+    Known(PaneContent),
     Unknown,
 }
 
@@ -98,12 +148,12 @@ struct Inner {
     id: String,
     open: String,
     target: Value,
-    viewer: Value,
-    context: RwLock<Value>,
+    viewer: PaneViewer,
+    context: RwLock<PaneContext>,
     gate: Mutex<Gate>,
     last: Mutex<Last>,
     input: Mutex<Option<InputFn>>,
-    on_context: Mutex<Vec<InputFn>>,
+    on_context: Mutex<Vec<ContextFn>>,
     on_close: Mutex<Vec<CloseFn>>,
     queue: Mutex<Option<Sender<Message>>>,
     handle: Handle,
@@ -127,23 +177,27 @@ impl Pane {
         &self.0.id
     }
 
+    fn pane_id(&self) -> buffa::MessageField<PaneId, buffa::Inline<PaneId>> {
+        PaneId { value: self.0.id.clone(), ..Default::default() }.into()
+    }
+
     /// Which of the manifest's `[[panes]]` it is.
     pub fn open(&self) -> &str {
         &self.0.open
     }
 
-    /// What to show: `{"url": …}`, `{"item": "MB-286"}`.
+    /// What to show: `{"url": …}`, `{"item": "MB-286"}` (the extension's own fields).
     pub fn target(&self) -> &Value {
         &self.0.target
     }
 
-    /// Who is looking: `{person, device}`.
-    pub fn viewer(&self) -> &Value {
+    /// Who is looking.
+    pub fn viewer(&self) -> &PaneViewer {
         &self.0.viewer
     }
 
-    /// What the person is looking at now: ids of a `thread`, `item`, `agent`, `post` or `file`.
-    pub fn context(&self) -> Value {
+    /// What the person is looking at now: a thread, item, agent, post or file.
+    pub fn context(&self) -> PaneContext {
         read(&self.0.context).clone()
     }
 
@@ -163,124 +217,112 @@ impl Pane {
         &self.0.handle
     }
 
-    /// All of a `blocks` pane's content: blocks, version 2.
-    pub fn set(&self, blocks: impl Serialize) {
-        let blocks = to_json(blocks);
-        let mut last = lock(&self.0.last);
-        self.notify("pane.set", "blocks", blocks.clone());
-        *last = Last::Known(blocks);
+    /// All of a `blocks` pane's content.
+    pub fn set(&self, blocks: Vec<Block>) {
+        self.set_content(PaneContent { blocks, ..Default::default() });
     }
 
     /// All of a `board` pane's content.
-    pub fn set_board(&self, board: impl Serialize) {
-        let board = to_json(board);
+    pub fn set_board(&self, board: &Value) {
+        self.set_content(PaneContent { board: convert::to_struct(board).into(), ..Default::default() });
+    }
+
+    fn set_content(&self, content: PaneContent) {
         let mut last = lock(&self.0.last);
-        self.notify("pane.set", "board", board.clone());
-        *last = Last::Known(board);
+        self.notify(&PaneSetRequest { pane: self.pane_id(), content: content.clone().into(), ..Default::default() });
+        *last = Last::Known(content);
     }
 
     /// All of a `blocks` pane's content, as it is now: only what changed since the last goes out, as
-    /// patches by id ([`changes`]), or all of it when the blocks themselves changed. Nothing when
-    /// nothing did.
-    pub fn show(&self, blocks: impl Serialize) {
-        self.show_as("blocks", to_json(blocks));
-    }
-
-    /// All of a `board` pane's content, as it is now: changed items go out as patches by id
-    /// ([`board_changes`]).
-    pub fn show_board(&self, board: impl Serialize) {
-        self.show_as("board", to_json(board));
-    }
-
-    fn show_as(&self, key: &str, new: Value) {
+    /// edits by block name and item id ([`edits::diff`]), or all of it when the edits can't say it. Nothing when
+    /// nothing did. Give each block a `name`, unique in the pane.
+    pub fn show(&self, blocks: Vec<Block>) {
         let mut last = lock(&self.0.last);
-        let ops = match &*last {
+        let new = PaneContent { blocks, ..Default::default() };
+        let edits = match &*last {
             Last::Known(old) if *old == new => return,
-            Last::Known(old) if key == "board" => Some(board_changes(old, &new)),
-            Last::Known(old) => changes(old, &new),
+            Last::Known(old) => edits::diff(&old.blocks, &new.blocks),
             Last::Unset | Last::Unknown => None,
         };
-        match ops {
-            Some(ops) if ops.is_empty() => {} // only what's the person's changed (the open tab)
-            Some(ops) => self.notify("pane.patch", "patch", Value::Array(ops)),
-            None => self.notify("pane.set", key, new.clone()),
+        self.send_diff(&mut last, new, edits);
+    }
+
+    /// All of a `board` pane's content, as it is now: changed items go out as edits by id
+    /// ([`edits::board_diff`]).
+    pub fn show_board(&self, board: &Value) {
+        let mut last = lock(&self.0.last);
+        let new = PaneContent { board: convert::to_struct(board).into(), ..Default::default() };
+        let edits = match &*last {
+            Last::Known(old) if *old == new => return,
+            Last::Known(old) => edits::board_diff(&convert::from_struct(old.board.as_option().unwrap_or(&Struct::default())), board),
+            Last::Unset | Last::Unknown => None,
+        };
+        self.send_diff(&mut last, new, edits);
+    }
+
+    fn send_diff(&self, last: &mut Last, new: PaneContent, edits: Option<Vec<PaneEdit>>) {
+        match edits {
+            Some(edits) if edits.is_empty() => {} // only what's the person's changed (the open tab)
+            Some(edits) => self.notify(&PaneEditRequest { pane: self.pane_id(), edits, ..Default::default() }),
+            None => self.notify(&PaneSetRequest { pane: self.pane_id(), content: new.clone().into(), ..Default::default() }),
         }
         *last = Last::Known(new);
     }
 
-    /// RFC 6902 operations on its content (add, replace and remove). Paths go through ids,
-    /// `/b/<block>/…` or `/i/<item>/…` ([`pointer`]), so a patch still lands when a list above it
-    /// grows.
-    pub fn patch(&self, ops: impl Serialize) {
-        let ops = to_json(ops);
-        if ops.as_array().is_some_and(|ops| !ops.is_empty()) {
-            let mut last = lock(&self.0.last);
-            self.notify("pane.patch", "patch", ops);
-            *last = Last::Unknown;
-        }
-    }
-
-    /// Set some of one block's fields, there before or not: `pane.update("count", json!({"value": 3}))`.
-    pub fn update(&self, block: &str, fields: Value) {
-        self.set_fields("b", block, fields);
-    }
-
-    /// Set some of one board item's fields: `pane.update_item("lin_9f2", json!({"state": "Done"}))`.
-    pub fn update_item(&self, item: &str, fields: Value) {
-        self.set_fields("i", item, fields);
-    }
-
-    /// A patch of field sets, kept in what [`show`](Self::show) compares with, so the next show sends
-    /// only what changed after it.
-    fn set_fields(&self, kind: &str, id: &str, fields: Value) {
-        let ops = set_ops(kind, id, &fields);
-        if ops.is_empty() {
+    /// Edits to its content, as they are (`edits::replace`, `put_items`…): applied in order, all or none, by the
+    /// node. What [`show`](Self::show) compares with follows them, so the next show sends only what changed after.
+    pub fn edit(&self, edits: Vec<PaneEdit>) {
+        if edits.is_empty() {
             return;
         }
         let mut last = lock(&self.0.last);
-        self.notify("pane.patch", "patch", Value::Array(ops));
-        let kept = match (&mut *last, fields) {
-            (Last::Known(content), Value::Object(fields)) => {
-                let target = if kind == "b" { find_block_mut(content, id) } else { find_item_mut(content, id) };
-                target.and_then(Value::as_object_mut).map(|target| target.extend(fields)).is_some()
-            }
-            _ => false,
+        self.notify(&PaneEditRequest { pane: self.pane_id(), edits: edits.clone(), ..Default::default() });
+        *last = match std::mem::replace(&mut *last, Last::Unknown) {
+            Last::Known(content) => edits::apply(&content, &edits).map_or(Last::Unknown, Last::Known),
+            _ => Last::Unknown,
         };
-        if !kept {
-            *last = Last::Unknown;
-        }
+    }
+
+    /// Replace one block, by its name.
+    pub fn replace(&self, block: Block) {
+        self.edit(vec![edits::replace(block, false)]);
+    }
+
+    /// Put one board item (a JSON object with its `id`): replaced where it is, or added.
+    pub fn put_board_item(&self, item: &Value) {
+        self.edit(vec![edits::put_board_items(&[item.clone()])]);
     }
 
     pub fn set_title(&self, title: &str) {
-        self.notify("pane.title", "title", json!(title));
+        self.notify(&PaneTitleRequest { pane: self.pane_id(), title: title.to_string(), ..Default::default() });
     }
 
     /// Close it from the extension's side: what it showed is gone, say.
     pub fn close(&self, reason: &str) {
         if self.drop_it(reason) {
-            self.0.handle.notify("pane.closed", json!({"pane": self.0.id, "reason": reason}));
+            self.0.handle.notify(&PaneClosedRequest { pane: self.pane_id(), reason: reason.to_string(), ..Default::default() });
         }
     }
 
-    /// `f(pane, event)` for each tap, submit, select, scroll_end, resize or board gesture
-    /// (`{kind, block, value}` or `{kind, item, to}`). Change the pane to answer it; return a
-    /// [`Refused`] (or any error) to turn it down. A pane with no handler refuses every input.
+    /// `f(pane, input)` for each tap, submit, select, scroll_end, resize or board gesture (`input.kind`, and its
+    /// fields: [`PaneInput::str`]). Change the pane to answer it; return a [`Refused`] (or any error) to turn it
+    /// down. A pane with no handler refuses every input.
     pub fn on_input<F, R>(&self, f: F) -> &Self
     where
-        F: Fn(&Pane, &Value) -> R + Send + Sync + 'static,
+        F: Fn(&Pane, &PaneInput) -> R + Send + Sync + 'static,
         R: Outcome,
     {
-        *lock(&self.0.input) = Some(Arc::new(move |pane: &Pane, event: &Value| f(pane, event).into_result()));
+        *lock(&self.0.input) = Some(Arc::new(move |pane: &Pane, event: &PaneInput| f(pane, event).into_result()));
         self
     }
 
     /// `f(pane, context)` when what the person is looking at changes.
     pub fn on_context<F, R>(&self, f: F) -> &Self
     where
-        F: Fn(&Pane, &Value) -> R + Send + Sync + 'static,
+        F: Fn(&Pane, &PaneContext) -> R + Send + Sync + 'static,
         R: Outcome,
     {
-        lock(&self.0.on_context).push(Arc::new(move |pane: &Pane, context: &Value| f(pane, context).into_result()));
+        lock(&self.0.on_context).push(Arc::new(move |pane: &Pane, context: &PaneContext| f(pane, context).into_result()));
         self
     }
 
@@ -294,8 +336,8 @@ impl Pane {
         self
     }
 
-    fn notify(&self, method: &str, key: &str, value: Value) {
-        let msg = json!({"jsonrpc": "2.0", "method": method, "params": {"pane": self.0.id, key: value}});
+    fn notify<N: Notification>(&self, n: &N) {
+        let msg = json!({"jsonrpc": "2.0", "method": N::METHOD, "params": to_json(n)});
         let mut gate = lock(&self.0.gate);
         if gate.closed.is_some() {
             return;
@@ -328,59 +370,24 @@ impl Pane {
     }
 }
 
-fn set_ops(kind: &str, id: &str, fields: &Value) -> Vec<Value> {
-    match fields {
-        Value::Object(fields) => fields
-            .iter()
-            .map(|(field, value)| json!({"op": "add", "path": pointer([kind, id, field.as_str()]), "value": value}))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The block with this id, anywhere in a `blocks` content (in `children` and `tabs[].children`).
-fn find_block_mut<'a>(v: &'a mut Value, id: &str) -> Option<&'a mut Value> {
-    let at = block_at(v, id, String::new())?;
-    v.pointer_mut(&at)
-}
-
-/// Where the block with this id is, as a JSON Pointer from the top of the content.
-fn block_at(v: &Value, id: &str, at: String) -> Option<String> {
-    for (i, block) in v.as_array()?.iter().enumerate() {
-        let here = format!("{at}/{i}");
-        if block["id"] == id {
-            return Some(here);
-        }
-        if let Some(found) = block_at(&block["children"], id, format!("{here}/children")) {
-            return Some(found);
-        }
-        for (t, tab) in block["tabs"].as_array().into_iter().flatten().enumerate() {
-            if let Some(found) = block_at(&tab["children"], id, format!("{here}/tabs/{t}/children")) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn find_item_mut<'a>(board: &'a mut Value, id: &str) -> Option<&'a mut Value> {
-    board.get_mut("items")?.as_array_mut()?.iter_mut().find(|item| item["id"] == id)
-}
-
 // ------------------------------------------------------------------ the node's side
+
+fn error(h: &Handle, rid: Option<Value>, message: String) {
+    if let Some(rid) = rid {
+        h.send(&json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": message}}));
+    }
+}
 
 /// One of the node's `pane.*` messages. `opener` is the open handler and the manifest's format
 /// for a `pane.open`.
-pub(crate) fn message(
-    h: &Handle,
-    method: &str,
-    p: &Value,
-    rid: Option<Value>,
-    opener: Option<(OpenFn, Option<String>)>,
-) {
-    let pid = p.get("pane").filter(|id| !id.is_null()).map(id_text).unwrap_or_default();
+pub(crate) fn message(h: &Handle, method: &str, params: Value, rid: Option<Value>, opener: Option<(OpenFn, Option<String>)>) {
     if method == "pane.open" {
-        let open = p["open"].as_str().unwrap_or_default().to_string();
+        let request: PaneOpenRequest = match from_params(params, method) {
+            Ok(request) => request,
+            Err(e) => return error(h, rid, format!("{e:#}")),
+        };
+        let pid = request.pane.as_option().map(|p| p.value.clone()).unwrap_or_default();
+        let open = request.open.clone();
         let mut panes = lock(&h.0.panes);
         let why = match &opener {
             None => Some(format!("{open} isn't a pane of {}", h.id())),
@@ -388,18 +395,17 @@ pub(crate) fn message(
             Some(_) if panes.contains_key(&pid) => Some(format!("pane '{pid}' is already open")),
             Some(_) => None,
         };
-        if let (Some(why), Some(rid)) = (&why, &rid) {
-            h.send(&json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": why}}));
+        if let Some(why) = &why {
+            error(h, rid.clone(), why.clone());
         }
         let Some((opener, format)) = opener.filter(|_| why.is_none()) else { return };
         let (tx, rx) = mpsc::channel();
-        let field = |key: &str| p.get(key).filter(|v| !v.is_null()).cloned().unwrap_or_else(|| json!({}));
         let pane = Pane(Arc::new(Inner {
             id: pid.clone(),
             open,
-            target: field("target"),
-            viewer: field("viewer"),
-            context: RwLock::new(field("context")),
+            target: convert::from_struct(&request.target),
+            viewer: request.viewer.as_option().cloned().unwrap_or_default(),
+            context: RwLock::new(request.context.as_option().cloned().unwrap_or_default()),
             gate: Mutex::new(Gate { closed: None, held: Some(Vec::new()) }),
             last: Mutex::new(Last::Unset),
             input: Mutex::new(None),
@@ -413,26 +419,30 @@ pub(crate) fn message(
         spawn(format!("pane-{pid}"), move || run(pane, rx, opener, format, rid));
         return;
     }
+    let pid = match method {
+        "pane.input" => from_params::<PaneInputRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option()),
+        "pane.context" => from_params::<PaneContextRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option()),
+        _ => from_params::<PaneCloseRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option()),
+    }
+    .map(|p| p.value)
+    .unwrap_or_default();
     let pane = lock(&h.0.panes).get(&pid).cloned();
     let Some(pane) = pane else {
-        if let Some(rid) = rid {
-            let why = format!("no pane {pid} is open");
-            h.send(&json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": why}}));
-        }
-        return;
+        return error(h, rid, format!("no pane {pid} is open"));
     };
     match method {
         "pane.close" => {
-            pane.drop_it(p["reason"].as_str().filter(|r| !r.is_empty()).unwrap_or("closed"));
+            let reason = from_params::<PaneCloseRequest>(params, method).map(|r| r.reason).unwrap_or_default();
+            pane.drop_it(if reason.is_empty() { "closed" } else { &reason });
         }
         "pane.context" => {
-            let context = p.get("context").filter(|c| !c.is_null()).cloned().unwrap_or_else(|| json!({}));
+            let context = from_params::<PaneContextRequest>(params, method).ok().and_then(|r| r.context.into_option()).unwrap_or_default();
             if let Some(tx) = lock(&pane.0.queue).as_ref() {
                 let _ = tx.send(Message::Context(context));
             }
         }
         _ => {
-            let event = p.get("event").filter(|e| !e.is_null()).cloned().unwrap_or_else(|| json!({}));
+            let event = from_params::<PaneInputRequest>(params, method).ok().and_then(|r| r.event.into_option()).unwrap_or_default();
             if let Some(tx) = lock(&pane.0.queue).as_ref() {
                 let _ = tx.send(Message::Input(event, rid));
             }
@@ -455,14 +465,16 @@ fn run(pane: Pane, rx: Receiver<Message>, opener: OpenFn, format: Option<String>
             // what the apps have now, unless it sent more while opening (which goes after the answer)
             let mut last = lock(&pane.0.last);
             if matches!(*last, Last::Unset) {
-                let content = answer.get("blocks").or_else(|| answer.get("board")).cloned();
-                *last = content.map_or(Last::Unknown, Last::Known);
+                *last = match &answer.first {
+                    Some(First::Content(content)) => Last::Known((**content).clone()),
+                    _ => Last::Unknown,
+                };
             }
             drop(last);
             // the answer first, then what it sent while opening
             let mut gate = lock(&pane.0.gate);
             if let Some(rid) = rid {
-                h.reply(rid, Ok(answer));
+                h.reply(rid, Ok(to_json(&answer)));
             }
             for msg in gate.held.take().unwrap_or_default() {
                 h.send(&msg);
@@ -497,10 +509,10 @@ fn run(pane: Pane, rx: Receiver<Message>, opener: OpenFn, format: Option<String>
                 };
                 let Some(rid) = rid else { continue };
                 h.send(&match outcome {
-                    Ok(()) => json!({"jsonrpc": "2.0", "id": rid, "result": {}}),
+                    Ok(()) => json!({"jsonrpc": "2.0", "id": rid, "result": to_json(PaneInputResponse::default())}),
                     Err(e) => {
                         if !caused_by::<Refused>(&e) {
-                            h.log(format!("pane {} input {event}: {e:?}", pane.0.id));
+                            h.log(format!("pane {} input {} {}: {e:?}", pane.0.id, event.kind, event.json()));
                         }
                         json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": text_or(&e, "refused")}})
                     }
@@ -510,209 +522,50 @@ fn run(pane: Pane, rx: Receiver<Message>, opener: OpenFn, format: Option<String>
     }
 }
 
+/// The format a manifest's `format` names.
+pub fn format_named(name: &str) -> Option<PaneFormat> {
+    Some(match name {
+        "blocks" => PaneFormat::PANE_FORMAT_BLOCKS,
+        "board" => PaneFormat::PANE_FORMAT_BOARD,
+        "page" => PaneFormat::PANE_FORMAT_PAGE,
+        "video" => PaneFormat::PANE_FORMAT_VIDEO,
+        "call" => PaneFormat::PANE_FORMAT_CALL,
+        _ => return None,
+    })
+}
+
 /// The open handler's answer, with the manifest's format, if it has what that format opens with.
-fn opened(pane: &Pane, answer: Value, format: Option<String>) -> anyhow::Result<Value> {
-    let Value::Object(given) = answer else {
-        bail!("the {} pane's handler must return an object, not {}", pane.0.open, kind_of(&answer));
+fn opened(pane: &Pane, mut answer: PaneOpenResponse, format: Option<String>) -> anyhow::Result<PaneOpenResponse> {
+    let given = answer.format.as_known().filter(|f| *f != PaneFormat::PANE_FORMAT_UNSPECIFIED);
+    let Some(format) = given.or_else(|| format.as_deref().and_then(format_named)) else {
+        bail!("the {} pane has no format (blocks, board, page, video or call) in extension.toml", pane.0.open);
     };
-    let mut answer = Map::new();
-    answer.insert("format".into(), format.map_or(Value::Null, Value::String));
-    answer.extend(given);
-    let format = answer["format"].as_str().unwrap_or_default().to_string();
-    let (key, ok, what): (&str, fn(&Value) -> bool, &str) = match format.as_str() {
-        "blocks" => ("blocks", Value::is_array, "an array"),
-        "board" => ("board", Value::is_object, "an object"),
-        "page" => ("path", Value::is_string, "a string"),
-        _ => bail!("the {} pane has no format (blocks, board or page) in extension.toml", pane.0.open),
+    answer.format = format.into();
+    let (ok, what) = match (format, &answer.first) {
+        (PaneFormat::PANE_FORMAT_BLOCKS, Some(First::Content(c))) => (c.board.is_unset(), "its content, as blocks"),
+        (PaneFormat::PANE_FORMAT_BOARD, Some(First::Content(c))) => (c.board.is_set(), "its content, as a board"),
+        (PaneFormat::PANE_FORMAT_PAGE, Some(First::Page(p))) => (!p.path.is_empty(), "its page, with a path"),
+        (PaneFormat::PANE_FORMAT_VIDEO, Some(First::Video(_))) => (true, ""),
+        (PaneFormat::PANE_FORMAT_CALL, Some(First::Call(_))) => (true, ""),
+        (PaneFormat::PANE_FORMAT_BLOCKS, _) => (false, "its content, as blocks"),
+        (PaneFormat::PANE_FORMAT_BOARD, _) => (false, "its content, as a board"),
+        (PaneFormat::PANE_FORMAT_PAGE, _) => (false, "its page, with a path"),
+        (PaneFormat::PANE_FORMAT_VIDEO, _) => (false, "its video"),
+        _ => (false, "its call"),
     };
-    if !answer.get(key).is_some_and(ok) {
-        bail!("a {format} pane opens with its {key}, {what}");
+    if !ok {
+        bail!("a {} pane opens with {what}", pane_format_word(format));
     }
-    Ok(Value::Object(answer))
+    Ok(answer)
 }
 
-/// What changed from one `blocks` content to the next, as patches by id: a block's changed fields are
-/// set, and a list that only grew gets its new entries added at the end (new comments slide in), so the
-/// apps keep their tab and their scroll. None when the blocks themselves changed (added, gone, moved
-/// or of another type): send all of it. Which tab is open is the person's, so `selected` never goes.
-pub fn changes(old: &Value, new: &Value) -> Option<Vec<Value>> {
-    let mut ops = Vec::new();
-    same_blocks(old.as_array()?, new.as_array()?, &mut ops).then_some(ops)
-}
-
-fn same_blocks(old: &[Value], new: &[Value], ops: &mut Vec<Value>) -> bool {
-    old.len() == new.len()
-        && old.iter().zip(new).all(|(a, b)| a["id"] == b["id"] && a["type"] == b["type"] && b["id"].is_string())
-        && old.iter().zip(new).all(|(a, b)| same_block(a, b, ops))
-}
-
-fn same_block(old: &Value, new: &Value, ops: &mut Vec<Value>) -> bool {
-    let (Some(a), Some(b), Some(id)) = (old.as_object(), new.as_object(), new["id"].as_str()) else { return false };
-    let none = Vec::new();
-    for key in a.keys().chain(b.keys().filter(|k| !a.contains_key(*k))) {
-        let (before, after) = (a.get(key), b.get(key));
-        if before == after || key == "selected" {
-            continue;
-        }
-        let path = pointer(["b", id, key.as_str()]);
-        match (key.as_str(), before, after) {
-            ("children", Some(Value::Array(x)), Some(Value::Array(y))) => {
-                if !same_blocks(x, y, ops) {
-                    return false;
-                }
-            }
-            ("tabs", Some(Value::Array(x)), Some(Value::Array(y))) => {
-                if x.len() != y.len() || x.iter().zip(y).any(|(s, t)| s["id"] != t["id"]) {
-                    return false;
-                }
-                for (i, (s, t)) in x.iter().zip(y).enumerate() {
-                    if s["title"] != t["title"] {
-                        let at = pointer(["b", id, "tabs", &i.to_string(), "title"]);
-                        ops.push(json!({"op": "add", "path": at, "value": t["title"]}));
-                    }
-                    let children = |tab: &Value| tab["children"].as_array().unwrap_or(&none).clone();
-                    if !same_blocks(&children(s), &children(t), ops) {
-                        return false;
-                    }
-                }
-            }
-            (_, Some(Value::Array(x)), Some(Value::Array(y))) if y.len() > x.len() && y.starts_with(x) => {
-                for item in &y[x.len()..] {
-                    ops.push(json!({"op": "add", "path": format!("{path}/-"), "value": item}));
-                }
-            }
-            (_, _, Some(value)) => ops.push(json!({"op": "add", "path": path, "value": value})),
-            (_, Some(_), None) => ops.push(json!({"op": "remove", "path": path})),
-            (_, None, None) => {}
-        }
-    }
-    true
-}
-
-/// What changed from one `board` content to the next: items by id (their changed fields set, new ones
-/// added, gone ones removed; the apps order cards by `rank`), and the rest (`project`, `states`,
-/// `groups`) whole where it changed.
-pub fn board_changes(old: &Value, new: &Value) -> Vec<Value> {
-    let mut ops = Vec::new();
-    let empty = Map::new();
-    let (a, b) = (old.as_object().unwrap_or(&empty), new.as_object().unwrap_or(&empty));
-    for key in a.keys().chain(b.keys().filter(|k| !a.contains_key(*k))).filter(|k| *k != "items") {
-        match (a.get(key), b.get(key)) {
-            (x, Some(y)) if x != Some(y) => ops.push(json!({"op": "add", "path": pointer(["board", key]), "value": y})),
-            (Some(_), None) => ops.push(json!({"op": "remove", "path": pointer(["board", key])})),
-            _ => {}
-        }
-    }
-    let items = |v: &Value| -> Vec<Value> { v["items"].as_array().cloned().unwrap_or_default() };
-    let (was, now) = (items(old), items(new));
-    let id = |item: &Value| item["id"].as_str().map(String::from);
-    for item in &was {
-        if let Some(i) = id(item).filter(|i| !now.iter().any(|n| id(n).as_deref() == Some(i))) {
-            ops.push(json!({"op": "remove", "path": pointer(["i", &i])}));
-        }
-    }
-    for item in &now {
-        let Some(i) = id(item) else { continue };
-        let Some(before) = was.iter().find(|w| id(w).as_deref() == Some(&i)) else {
-            ops.push(json!({"op": "add", "path": "/board/items/-", "value": item}));
-            continue;
-        };
-        let (x, y) = (before.as_object().unwrap_or(&empty), item.as_object().unwrap_or(&empty));
-        for key in x.keys().chain(y.keys().filter(|k| !x.contains_key(*k))) {
-            match (x.get(key), y.get(key)) {
-                (p, Some(q)) if p != Some(q) => {
-                    ops.push(json!({"op": "add", "path": pointer(["i", &i, key]), "value": q}))
-                }
-                (Some(_), None) => ops.push(json!({"op": "remove", "path": pointer(["i", &i, key])})),
-                _ => {}
-            }
-        }
-    }
-    ops
-}
-
-fn kind_of(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pointers_escape_their_parts() {
-        assert_eq!(pointer(["b", "files/2", "a~b"]), "/b/files~12/a~0b");
-        assert_eq!(pointer(["i", "lin_9f2", "state"]), "/i/lin_9f2/state");
-        assert_eq!(pointer::<_, &str>([]), "");
-    }
-
-    #[test]
-    fn changes_go_by_id_and_lists_that_grew_get_added_to() {
-        let old = json!([
-            {"type": "heading", "id": "head", "text": "PR 42", "subtitle": "open"},
-            {"type": "tabs", "id": "tabs", "selected": "a", "tabs": [
-                {"id": "a", "title": "Conversation", "children": [
-                    {"type": "timeline", "id": "timeline", "events": [{"id": "e1"}]}]},
-                {"id": "b", "title": "Files 1", "children": [{"type": "stat", "id": "n", "value": 1, "tone": "good"}]}]}]);
-        let mut new = old.clone();
-        new[0]["subtitle"] = json!("merged");
-        new[1]["selected"] = json!("b");
-        new[1]["tabs"][0]["children"][0]["events"].as_array_mut().unwrap().push(json!({"id": "e2"}));
-        new[1]["tabs"][1]["title"] = json!("Files 2");
-        new[1]["tabs"][1]["children"][0]["value"] = json!(2);
-        new[1]["tabs"][1]["children"][0].as_object_mut().unwrap().remove("tone");
-        assert_eq!(
-            changes(&old, &new).unwrap(),
-            [
-                json!({"op": "add", "path": "/b/head/subtitle", "value": "merged"}),
-                json!({"op": "add", "path": "/b/timeline/events/-", "value": {"id": "e2"}}),
-                json!({"op": "add", "path": "/b/tabs/tabs/1/title", "value": "Files 2"}),
-                json!({"op": "remove", "path": "/b/n/tone"}),
-                json!({"op": "add", "path": "/b/n/value", "value": 2}),
-            ]
-        );
-        assert_eq!(changes(&old, &old), Some(vec![]));
-        // blocks added, gone, moved or of another type: all of it goes
-        assert_eq!(changes(&old, &json!([old[1], old[0]])), None);
-        assert_eq!(changes(&old, &json!([old[0]])), None);
-        let mut retyped = old.clone();
-        retyped[0]["type"] = json!("text");
-        assert_eq!(changes(&old, &retyped), None);
-    }
-
-    #[test]
-    fn board_changes_go_by_item() {
-        let old = json!({"project": {"key": "ALA"}, "states": [{"name": "Todo"}], "items": [
-            {"id": "a", "state": "Todo", "title": "A", "owner": "james"}, {"id": "b", "state": "Todo"}]});
-        let new = json!({"project": {"key": "ALA"}, "states": [{"name": "Todo"}, {"name": "Done"}], "items": [
-            {"id": "a", "state": "Done", "title": "A"}, {"id": "c", "state": "Todo"}]});
-        assert_eq!(
-            board_changes(&old, &new),
-            [
-                json!({"op": "add", "path": "/board/states", "value": [{"name": "Todo"}, {"name": "Done"}]}),
-                json!({"op": "remove", "path": "/i/b"}),
-                json!({"op": "remove", "path": "/i/a/owner"}),
-                json!({"op": "add", "path": "/i/a/state", "value": "Done"}),
-                json!({"op": "add", "path": "/board/items/-", "value": {"id": "c", "state": "Todo"}}),
-            ]
-        );
-        assert!(board_changes(&new, &new).is_empty());
-    }
-
-    #[test]
-    fn update_sets_each_field_by_id() {
-        assert_eq!(
-            Value::Array(set_ops("b", "count", &json!({"value": 3, "tone": "good"}))),
-            json!([{"op": "add", "path": "/b/count/tone", "value": "good"},
-                   {"op": "add", "path": "/b/count/value", "value": 3}])
-        );
-        assert!(set_ops("i", "x", &json!(null)).is_empty());
+pub(crate) fn pane_format_word(format: PaneFormat) -> &'static str {
+    match format {
+        PaneFormat::PANE_FORMAT_BLOCKS => "blocks",
+        PaneFormat::PANE_FORMAT_BOARD => "board",
+        PaneFormat::PANE_FORMAT_PAGE => "page",
+        PaneFormat::PANE_FORMAT_VIDEO => "video",
+        PaneFormat::PANE_FORMAT_CALL => "call",
+        _ => "unspecified",
     }
 }

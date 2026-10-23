@@ -1,0 +1,33 @@
+{
+  "method": "board.post",
+  "params": {
+    "thread": {
+      "value": "thr_13661"
+    },
+    "text": "Render done: cut 3.",
+    "blocks": [
+      {
+        "name": "count",
+        "chart": {
+          "type": "TYPE_STAT",
+          "title": "Taps",
+          "data": {
+            "columns": [
+              "value"
+            ],
+            "rows": [
+              [
+                3.0
+              ]
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "result": {
+    "post": {
+      "value": "post_19455"
+    }
+  }
+}

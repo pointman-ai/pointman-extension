@@ -1,0 +1,23 @@
+{
+  "method": "mcp.call_tool",
+  "params": {
+    "person": {
+      "handle": "james"
+    },
+    "name": "list_issues",
+    "arguments": {
+      "team": "ALA"
+    }
+  },
+  "result": {
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "2 issues"
+        }
+      ],
+      "isError": false
+    }
+  }
+}

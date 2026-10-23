@@ -1,0 +1,20 @@
+{
+  "method": "session.ended",
+  "params": {
+    "run": {
+      "value": "run_6296"
+    },
+    "handle": {
+      "handle": "loupe"
+    },
+    "client": "claude",
+    "account": "work",
+    "status": "STATUS_LIMITED",
+    "limits": {
+      "five_hour": {
+        "utilization": 1.0
+      }
+    }
+  },
+  "result": {}
+}

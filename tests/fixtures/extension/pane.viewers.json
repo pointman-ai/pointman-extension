@@ -1,0 +1,9 @@
+{
+  "method": "pane.viewers",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "attached": 2
+  }
+}

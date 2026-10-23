@@ -1,0 +1,11 @@
+{
+  "method": "failed",
+  "params": {
+    "id": {
+      "value": "req-413"
+    },
+    "error": "Resolve isn't open",
+    "retry": true,
+    "code": "not_open"
+  }
+}

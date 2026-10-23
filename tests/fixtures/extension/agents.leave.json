@@ -1,0 +1,9 @@
+{
+  "method": "agents.leave",
+  "params": {
+    "live": {
+      "value": "run_6296"
+    }
+  },
+  "result": {}
+}

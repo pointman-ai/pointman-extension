@@ -1,0 +1,12 @@
+{
+  "method": "pane.event",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "event": {
+      "kind": "caption",
+      "text": "Hello"
+    }
+  }
+}

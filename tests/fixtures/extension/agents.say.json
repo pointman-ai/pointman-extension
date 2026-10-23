@@ -1,0 +1,10 @@
+{
+  "method": "agents.say",
+  "params": {
+    "live": {
+      "value": "run_6296"
+    },
+    "text": "What's live?"
+  },
+  "result": {}
+}

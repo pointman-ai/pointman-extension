@@ -1,0 +1,10 @@
+{
+  "method": "pane.audio",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "capturedMs": "1792800000140",
+    "opus": "T3B1c0hlYWQ="
+  }
+}

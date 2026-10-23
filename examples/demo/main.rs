@@ -1,6 +1,6 @@
 //! Every part of the SDK in one extension, for the SDK's own tests: commands with and without a
-//! lane, progress, checkpoints, outputs, events, retry, cancel, secrets, the node's own requests,
-//! requests to the node, settings and a periodic task.
+//! lane, progress, checkpoints, outputs, events, retry, cancel, secrets, the node's own requests
+//! (`mcp.call_tool`, standing in for any), requests to the node, settings and a periodic task.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -8,7 +8,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
-use pointman_extension::{Extension, Handle, Job, Retry};
+use pointman_extension::protocol::output_request::Role;
+use pointman_extension::protocol::{
+    FilesGetRequest, FilesListRequest, FilesPutRequest, McpCallToolRequest, McpCallToolResponse,
+};
+use pointman_extension::{convert, Extension, Handle, Job, Retry};
 use serde_json::{json, Value};
 
 fn now_ms() -> u128 {
@@ -37,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         job.save(json!({"echoed": true}));
         let out = job.work.join("echo.json");
         std::fs::write(&out, job.params.to_string())?;
-        job.output(&out, "document", "", Value::Null);
+        job.output(&out, "document", Role::Main, Value::Null);
         echo.event("demo.echo", json!({"last": job.params}));
         echo.event("demo.echo", json!({"last": job.params}));
         Ok(json!({
@@ -89,7 +93,7 @@ fn main() -> anyhow::Result<()> {
             out["value"] = json!(vault.secret(name)?);
         }
         if let Some(prefix) = job.params["prefix"].as_str() {
-            out["names"] = vault.request("secret.list", json!({"prefix": prefix}))?["names"].clone();
+            out["names"] = json!(vault.secrets(prefix)?);
         }
         Ok(out)
     });
@@ -99,30 +103,44 @@ fn main() -> anyhow::Result<()> {
         Ok(json!({"path": paths.allowed(job.params["path"].as_str().unwrap_or_default())?}))
     });
 
-    // the node's own requests, beyond commands
+    // the node's own requests, beyond commands: a tool call, by tool name, `ask` or `relay`
     let asked = h.clone();
-    ext.method("demo.ask", move |params: Value| {
-        if params["fail"] == true {
-            bail!("asked to fail");
-        }
-        if let Some(ms) = params["sleep_ms"].as_u64() {
-            thread::sleep(Duration::from_millis(ms));
-        }
-        Ok(json!({"params": params, "settings": asked.settings(), "thread": thread_name()}))
-    });
-    let relay = h.clone();
-    ext.method("demo.relay", move |params: Value| {
-        relay.request(params["method"].as_str().unwrap_or_default(), params["params"].clone())
+    ext.on(move |call: McpCallToolRequest| {
+        let args = convert::from_struct(&call.arguments);
+        let result = match call.name.as_str() {
+            "ask" => {
+                if args["fail"] == true {
+                    bail!("asked to fail");
+                }
+                if let Some(ms) = args["sleep_ms"].as_u64() {
+                    thread::sleep(Duration::from_millis(ms));
+                }
+                json!({"params": args, "settings": asked.settings(), "thread": thread_name()})
+            }
+            // a request to the node: its answer back, or its reason
+            "relay" => match args["method"].as_str().unwrap_or_default() {
+                "files.get" => {
+                    let path = args["path"].as_str().unwrap_or_default().to_string();
+                    let got = asked.request(&FilesGetRequest { path, ..Default::default() })?;
+                    serde_json::to_value(got)?
+                }
+                "files.put" => {
+                    let (path, text) = (args["path"].as_str(), args["text"].as_str());
+                    let put = FilesPutRequest {
+                        path: path.unwrap_or_default().into(),
+                        text: text.unwrap_or_default().into(),
+                        ..Default::default()
+                    };
+                    serde_json::to_value(asked.request(&put)?)?
+                }
+                _ => serde_json::to_value(asked.request(&FilesListRequest::default())?)?,
+            },
+            other => bail!("no tool {other}"),
+        };
+        Ok(McpCallToolResponse { result: convert::to_struct(&result).into(), ..Default::default() })
     });
 
     ext.on_start(|h: &Handle| h.event("demo.started", json!({"node": h.node(), "settings": h.settings()})));
-    ext.on_settings(|h: &Handle| -> anyhow::Result<()> {
-        if h.settings()["label"] == "bad" {
-            bail!("bad label");
-        }
-        h.event("demo.settings", h.settings());
-        Ok(())
-    });
     ext.every(
         Duration::from_millis(50),
         move |h: &Handle| h.event("demo.tick", json!({"ticks": ticks.fetch_add(1, Ordering::SeqCst) + 1})),
