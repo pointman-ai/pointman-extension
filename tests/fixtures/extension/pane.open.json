@@ -1,0 +1,45 @@
+{
+  "method": "pane.open",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "open": "live",
+    "target": {},
+    "context": {
+      "thread": {
+        "value": "thr_17979"
+      }
+    },
+    "viewer": {
+      "person": {
+        "handle": "james"
+      }
+    }
+  },
+  "result": {
+    "format": "PANE_FORMAT_BLOCKS",
+    "title": "Live traces",
+    "content": {
+      "blocks": [
+        {
+          "name": "count",
+          "chart": {
+            "type": "TYPE_STAT",
+            "title": "Taps",
+            "data": {
+              "columns": [
+                "value"
+              ],
+              "rows": [
+                [
+                  3.0
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

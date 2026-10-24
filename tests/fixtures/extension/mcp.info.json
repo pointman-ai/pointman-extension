@@ -1,0 +1,8 @@
+{
+  "method": "mcp.info",
+  "params": {},
+  "result": {
+    "name": "Linear",
+    "instructions": "Use the tools for Linear issues."
+  }
+}

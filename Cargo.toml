@@ -1,6 +1,6 @@
 [package]
 name = "pointman-extension"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "The extension side of the Pointman node's extension protocol, and a stand-in node for tests"
@@ -12,6 +12,9 @@ keywords = ["pointman", "extension", "json-rpc"]
 name = "pointman_extension"
 
 [dependencies]
+buffa = { version = "0.9.2", features = ["json"] }
+buffa-descriptor = { version = "0.9.2", features = ["json", "reflect"] }
+buffa-types = { version = "0.9.2", features = ["json", "reflect"] }
 anyhow = "1"
 serde = "1"
 serde_json = "1"
@@ -28,3 +31,16 @@ path = "examples/demo/main.rs"
 [[example]]
 name = "panes"
 path = "examples/panes/main.rs"
+
+[[example]]
+name = "trim_descriptors"
+path = "examples/trim_descriptors.rs"
+
+[build-dependencies]
+buffa = "0.9.2"
+buffa-build = "0.9.2"
+buffa-descriptor = "0.9.2"
+
+[[example]]
+name = "video"
+path = "examples/video/main.rs"

@@ -1,0 +1,13 @@
+{
+  "method": "oauth.save",
+  "params": {
+    "person": {
+      "handle": "james"
+    },
+    "data": {
+      "access_token": "y"
+    },
+    "state": "s1"
+  },
+  "result": {}
+}

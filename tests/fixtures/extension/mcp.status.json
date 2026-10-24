@@ -1,0 +1,11 @@
+{
+  "method": "mcp.status",
+  "params": {
+    "person": {
+      "handle": "james"
+    }
+  },
+  "result": {
+    "url": "https://mcp.linear.app/mcp"
+  }
+}

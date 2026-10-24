@@ -1,0 +1,14 @@
+{
+  "method": "progress",
+  "params": {
+    "id": {
+      "value": "req-412"
+    },
+    "fraction": 0.5,
+    "stage": "rendering",
+    "detail": {
+      "frames_total": 250.0,
+      "frames_done": 125.0
+    }
+  }
+}

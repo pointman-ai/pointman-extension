@@ -1,0 +1,25 @@
+{
+  "method": "files.publish",
+  "params": {
+    "body": {
+      "files": [
+        {
+          "name": "cut.mov",
+          "file": "/w/resolve/req-412/cut.mov"
+        }
+      ],
+      "thread_id": 13661.0
+    }
+  },
+  "result": {
+    "file": {
+      "value": "file_2636"
+    },
+    "version": {
+      "value": "ver_9001"
+    },
+    "post": {
+      "value": "post_19455"
+    }
+  }
+}

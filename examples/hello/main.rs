@@ -3,6 +3,7 @@
 //! `h.log(…)`: stdout is the node's.
 
 use anyhow::Context;
+use pointman_extension::protocol::output_request::Role;
 use pointman_extension::{Extension, Job};
 use serde_json::json;
 
@@ -17,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         job.progress(0.5, "writing");
         let out = job.work.join("greeting.txt");
         std::fs::write(&out, format!("{text}\n"))?;
-        job.output(&out, "text", "main", json!({})); // posted where the request came from
+        job.output(&out, "text", Role::Main, json!({})); // posted where the request came from
         h.event("hello.last", json!({"name": name}));
         Ok(json!({"text": text}))
     });

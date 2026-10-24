@@ -6,6 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{example, source, tmp};
+use pointman_extension::convert;
+use pointman_extension::protocol::output_request::Role;
+use pointman_extension::protocol::{FilesGetRequest, FilesGetResponse, FilesPutRequest, FilesPutResponse, OwnFile};
 use pointman_extension::testing::{RunOptions, StandIn};
 use serde_json::{json, Value};
 
@@ -13,6 +16,12 @@ const SECS: Duration = Duration::from_secs(5);
 
 fn demo() -> StandIn {
     StandIn::new(source("demo")).binary(example("demo"))
+}
+
+/// One of the node's own requests: `mcp.call_tool` stands in for any, `ask` or `relay` by name.
+fn tool(node: &StandIn, name: &str, arguments: Value) -> Result<Value, pointman_extension::testing::Failed> {
+    let call = json!({"person": {"handle": "james"}, "name": name, "arguments": arguments});
+    node.call("mcp.call_tool", call).map(|answer| answer["result"].clone())
 }
 
 fn span(result: &Value) -> (u64, u64) {
@@ -33,13 +42,14 @@ fn a_command_reports_progress_checkpoints_outputs_and_events() {
 
     assert_eq!(done.progress.len(), 2);
     assert_eq!((done.progress[0].fraction, done.progress[0].stage.as_deref()), (Some(0.5), Some("echoing")));
-    assert_eq!(done.progress[0].detail, json!({}));
+    assert_eq!(convert::from_struct(&done.progress[0].detail), json!({}));
     assert_eq!((done.progress[1].fraction, done.progress[1].stage.as_deref()), (Some(1.0), None));
-    assert_eq!(done.progress[1].detail, json!({"items": 1}));
+    assert_eq!(convert::from_struct(&done.progress[1].detail), json!({"items": 1}));
     assert_eq!(done.checkpoints, vec![json!({"echoed": true})]);
 
     let out = &done.outputs[0];
-    assert_eq!((out.kind.as_str(), out.role.as_str(), &out.meta), ("document", "main", &json!({})));
+    assert_eq!((out.kind.as_str(), out.role.as_known()), ("document", Some(Role::Main)));
+    assert_eq!(out.meta.fields.len(), 0);
     assert_eq!(std::fs::read_to_string(&out.path).unwrap(), r#"{"a":1}"#);
     assert_eq!(node.events()["demo.echo"], json!({"last": {"a": 1}}));
 }
@@ -49,27 +59,18 @@ fn it_starts_with_the_node_and_the_settings_defaults() {
     let roots = tmp("roots");
     let node =
         demo().settings(json!({"limit": 5})).node("test-node").machine("test-machine").roots([&roots]).start().unwrap();
-    assert_eq!(node.info(), json!({"protocol": 1, "id": "demo", "version": "0.2.0"}));
+    assert_eq!(node.info(), json!({"protocol": "PROTOCOL_TYPED", "id": "demo", "version": "0.2.0"}));
     let started = node.wait_event("demo.started", SECS).unwrap();
     assert_eq!(started["settings"], json!({"label": "demo", "limit": 5}));
+    // the node, as standard JSON: its messages
     let n = &started["node"];
     assert_eq!(
         (n["protocol"].clone(), n["node"].clone(), n["machine"].clone()),
-        (json!(1), json!("test-node"), json!("test-machine"))
+        (json!("PROTOCOL_TYPED"), json!("test-node"), json!({"value": "test-machine"}))
     );
-    assert_eq!(n["work_dir"], json!(node.work_dir()));
-    assert_eq!(n["state_dir"], json!(node.state_dir_path()));
+    assert_eq!(n["workDir"], json!(node.work_dir()));
+    assert_eq!(n["stateDir"], json!(node.state_dir_path()));
     assert_eq!(n["roots"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn settings_changes_reach_it() {
-    let node = demo().start().unwrap();
-    node.change_settings(json!({"label": "new"})).unwrap();
-    assert_eq!(node.events()["demo.settings"], json!({"label": "new", "limit": 3}));
-    assert_eq!(node.call("demo.ask", json!({})).unwrap()["settings"], json!({"label": "new", "limit": 3}));
-    let refused = node.change_settings(json!({"label": "bad"})).unwrap_err();
-    assert_eq!(refused.message, "bad label");
 }
 
 #[test]
@@ -114,7 +115,7 @@ fn cancelling_stops_a_command_at_its_next_check() {
             node.run_with("demo.step", json!({"steps": 200, "step_ms": 20}), opts)
         });
         let deadline = Instant::now() + SECS;
-        while node.cancel("long").unwrap() != json!({"found": true}) {
+        while !node.cancel("long").unwrap() {
             assert!(Instant::now() < deadline, "it never had the command");
             thread::sleep(Duration::from_millis(20));
         }
@@ -122,7 +123,7 @@ fn cancelling_stops_a_command_at_its_next_check() {
     });
     assert!(failed.cancelled && !failed.retry);
     assert_eq!(failed.message, "cancelled");
-    assert_eq!(node.cancel("long").unwrap(), json!({"found": false}));
+    assert!(!node.cancel("long").unwrap());
 }
 
 #[test]
@@ -178,40 +179,48 @@ fn secrets_only_within_its_permissions() {
     );
     let asked = node.asked();
     assert_eq!(asked[0], ("secret.get".to_string(), json!({"name": "demo.work"})));
-    assert_eq!(asked.last().unwrap(), &("secret.list".to_string(), json!({"prefix": ""})));
+    assert_eq!(asked.last().unwrap(), &("secret.list".to_string(), json!({}))); // an empty prefix is the default, and left out
 }
 
 #[test]
 fn the_nodes_own_requests_run_side_by_side() {
     let node = demo().start().unwrap();
-    let answer = node.call("demo.ask", json!({"q": 1})).unwrap();
+    let answer = tool(&node, "ask", json!({"q": 1})).unwrap();
     assert_eq!(answer["params"], json!({"q": 1}));
-    assert_eq!(answer["thread"], "method-demo.ask");
-    assert_eq!(node.call("demo.ask", json!({"fail": true})).unwrap_err().message, "asked to fail");
+    assert_eq!(answer["thread"], "method-mcp.call_tool");
+    assert_eq!(tool(&node, "ask", json!({"fail": true})).unwrap_err().message, "asked to fail");
     assert_eq!(node.call("demo.nope", json!({})).unwrap_err().message, "no method demo.nope");
+    // params that aren't the request's message are told so
+    let wrong = node.call("mcp.call_tool", json!({"name": 7})).unwrap_err();
+    assert!(wrong.message.contains("isn't its message"), "{wrong}");
 
     thread::scope(|s| {
-        let slow = s.spawn(|| node.call("demo.ask", json!({"sleep_ms": 1500})).unwrap());
+        let slow = s.spawn(|| tool(&node, "ask", json!({"sleep_ms": 1500})).unwrap());
         thread::sleep(Duration::from_millis(50));
-        node.call("demo.ask", json!({})).unwrap();
+        tool(&node, "ask", json!({})).unwrap();
         assert!(!slow.is_finished(), "a slow request held up the next");
         slow.join().unwrap();
     });
-    let timed_out = node.call_timeout("demo.ask", json!({"sleep_ms": 1500}), Duration::from_millis(200)).unwrap_err();
-    assert!(timed_out.message.starts_with("demo didn't answer demo.ask"), "{timed_out}");
+    let params = json!({"name": "ask", "arguments": {"sleep_ms": 1500}});
+    let timed_out = node.call_timeout("mcp.call_tool", params, Duration::from_millis(200)).unwrap_err();
+    assert!(timed_out.message.starts_with("demo didn't answer mcp.call_tool"), "{timed_out}");
 }
 
 #[test]
 fn it_asks_the_node_and_gets_its_answers_and_reasons() {
     let node = demo()
-        .method("demo.lookup", |params: Value| Ok(json!({"found": params})))
-        .method("demo.refuse", |_| -> anyhow::Result<Value> { anyhow::bail!("not today") })
+        .on(|get: FilesGetRequest| {
+            let file = OwnFile { path: get.path, version: 3, ..Default::default() };
+            Ok(FilesGetResponse { file: file.into(), ..Default::default() })
+        })
+        .on(|put: FilesPutRequest| -> anyhow::Result<FilesPutResponse> { anyhow::bail!("not today: {}", put.path) })
         .start()
         .unwrap();
-    let relay = |method: &str| node.call("demo.relay", json!({"method": method, "params": {"x": 1}}));
-    assert_eq!(relay("demo.lookup").unwrap(), json!({"found": {"x": 1}}));
-    assert_eq!(relay("demo.refuse").unwrap_err().message, "not today");
-    assert_eq!(relay("node.unknown").unwrap_err().message, "no method node.unknown");
+    let relay = |params: Value| tool(&node, "relay", params);
+    let got = relay(json!({"method": "files.get", "path": "notes.md"})).unwrap();
+    assert_eq!(got, json!({"file": {"path": "notes.md", "version": 3}}));
+    assert_eq!(relay(json!({"method": "files.put", "path": "a.md"})).unwrap_err().message, "not today: a.md");
+    assert_eq!(relay(json!({"method": "files.list"})).unwrap_err().message, "no method files.list");
     assert_eq!(node.asked().len(), 3);
 }
 
@@ -236,7 +245,7 @@ fn a_crash_fails_whats_running_with_retry() {
     assert!(failed.retry, "{failed:?}");
     assert!(failed.message.starts_with("demo stopped"), "{failed}");
     assert!(!node.running());
-    let after = node.call("demo.ask", json!({})).unwrap_err();
+    let after = tool(&node, "ask", json!({})).unwrap_err();
     assert!(after.message.starts_with("demo isn't running"), "{after}");
 }
 

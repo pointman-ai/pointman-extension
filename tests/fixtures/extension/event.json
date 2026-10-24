@@ -1,0 +1,10 @@
+{
+  "method": "event",
+  "params": {
+    "name": "trace.status",
+    "data": {
+      "panes": 1.0,
+      "runs": 12.0
+    }
+  }
+}

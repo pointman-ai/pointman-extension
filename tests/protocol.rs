@@ -82,7 +82,7 @@ impl Wire {
     fn notes(&mut self, cid: &str, until: &str) -> Vec<Value> {
         let mut notes = Vec::new();
         loop {
-            let msg = self.next(|m| m["params"]["id"] == cid && m.get("id").is_none());
+            let msg = self.next(|m| m["params"]["id"]["value"] == cid && m.get("id").is_none());
             let done = msg["method"] == until;
             notes.push(msg);
             if done {
@@ -93,12 +93,12 @@ impl Wire {
 
     fn initialize(&mut self, work: &Path) {
         self.send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocol": 1, "node": "n", "machine": "m", "settings": {"label": "x"},
-            "work_dir": work, "state_dir": work, "roots": [],
+            "protocol": "PROTOCOL_TYPED", "node": "n", "machine": {"value": "m"}, "settings": {"label": "x"},
+            "workDir": work, "stateDir": work, "roots": [],
         }}));
         assert_eq!(
             self.answer(1),
-            json!({"jsonrpc": "2.0", "id": 1, "result": {"protocol": 1, "id": "demo", "version": "0.2.0"}})
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"protocol": "PROTOCOL_TYPED", "id": "demo", "version": "0.2.0"}})
         );
     }
 
@@ -116,32 +116,35 @@ fn wire() -> (Wire, std::path::PathBuf) {
     (w, work)
 }
 
+fn id(value: &str) -> Value {
+    json!({"value": value})
+}
+
 #[test]
 fn a_command_on_the_wire() {
     let (mut w, work) = wire();
-    let start =
-        json!({"id": "c1", "kind": "demo.echo", "params": {"a": 1}, "work": work.join("c1"), "checkpoint": null});
+    let start = json!({"id": id("c1"), "kind": "demo.echo", "params": {"a": 1}, "work": work.join("c1")});
     w.send(json!({"jsonrpc": "2.0", "id": 2, "method": "command.start", "params": start}));
-    assert_eq!(w.answer(2), json!({"jsonrpc": "2.0", "id": 2, "result": {"accepted": true}}));
+    assert_eq!(w.answer(2), json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
     let notes = w.notes("c1", "done");
     let out = work.join("c1/echo.json").to_string_lossy().into_owned();
     assert_eq!(
         notes[..4],
         [
-            json!({"jsonrpc": "2.0", "method": "progress", "params": {"id": "c1", "fraction": 0.5, "stage": "echoing", "detail": {}}}),
-            json!({"jsonrpc": "2.0", "method": "progress", "params": {"id": "c1", "fraction": 1.0, "stage": null, "detail": {"items": 1}}}),
-            json!({"jsonrpc": "2.0", "method": "checkpoint", "params": {"id": "c1", "state": {"echoed": true}}}),
-            json!({"jsonrpc": "2.0", "method": "output", "params": {"id": "c1", "path": out, "kind": "document", "role": "main", "meta": {}}}),
+            json!({"jsonrpc": "2.0", "method": "progress", "params": {"id": id("c1"), "fraction": 0.5, "stage": "echoing", "detail": {}}}),
+            json!({"jsonrpc": "2.0", "method": "progress", "params": {"id": id("c1"), "fraction": 1.0, "detail": {"items": 1.0}}}),
+            json!({"jsonrpc": "2.0", "method": "checkpoint", "params": {"id": id("c1"), "state": {"echoed": true}}}),
+            json!({"jsonrpc": "2.0", "method": "output", "params": {"id": id("c1"), "path": out, "kind": "document", "role": "ROLE_MAIN", "meta": {}}}),
         ]
     );
     let done = notes.last().unwrap();
     assert_eq!(done["method"], "done");
-    assert_eq!(done["params"]["result"]["params"], json!({"a": 1}));
+    assert_eq!(done["params"]["result"]["params"], json!({"a": 1.0}));
     // the event went once, though sent twice
     let echoes: Vec<&Value> = w.seen.iter().filter(|m| m["params"]["name"] == "demo.echo").collect();
     assert_eq!(
         echoes,
-        [&json!({"jsonrpc": "2.0", "method": "event", "params": {"name": "demo.echo", "data": {"last": {"a": 1}}}})]
+        [&json!({"jsonrpc": "2.0", "method": "event", "params": {"name": "demo.echo", "data": {"last": {"a": 1.0}}}})]
     );
     w.send(json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}));
     assert_eq!(w.answer(3), json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
@@ -151,32 +154,37 @@ fn a_command_on_the_wire() {
 #[test]
 fn the_same_id_again_is_the_same_command() {
     let (mut w, work) = wire();
-    let start = json!({"id": 7, "kind": "demo.step", "params": {"steps": 10, "step_ms": 30}, "work": work.join("7")});
+    let start =
+        json!({"id": id("7"), "kind": "demo.step", "params": {"steps": 10, "step_ms": 30}, "work": work.join("7")});
     w.send(json!({"jsonrpc": "2.0", "id": 2, "method": "command.start", "params": start}));
-    assert_eq!(w.answer(2)["result"], json!({"accepted": true}));
+    assert_eq!(w.answer(2)["result"], json!({}));
     w.send(json!({"jsonrpc": "2.0", "id": 3, "method": "command.start", "params": start}));
-    assert_eq!(w.answer(3)["result"], json!({"accepted": true, "already": true}));
-    w.send(json!({"jsonrpc": "2.0", "id": 4, "method": "command.cancel", "params": {"id": 7}}));
+    assert_eq!(w.answer(3)["result"], json!({"already": true}));
+    w.send(json!({"jsonrpc": "2.0", "id": 4, "method": "command.cancel", "params": {"id": id("7")}}));
     assert_eq!(w.answer(4)["result"], json!({"found": true}));
     let failed = w.notes("7", "failed").pop().unwrap();
-    assert_eq!(failed["params"], json!({"id": "7", "error": "cancelled", "retry": false, "cancelled": true}));
-    w.send(json!({"jsonrpc": "2.0", "id": 5, "method": "command.cancel", "params": {"id": "nope"}}));
-    assert_eq!(w.answer(5)["result"], json!({"found": false}));
+    assert_eq!(failed["params"], json!({"id": id("7"), "error": "cancelled", "cancelled": true}));
+    w.send(json!({"jsonrpc": "2.0", "id": 5, "method": "command.cancel", "params": {"id": id("nope")}}));
+    assert_eq!(w.answer(5)["result"], json!({}), "found: false is the default, left out");
 }
 
 #[test]
 fn failures_on_the_wire() {
     let (mut w, work) = wire();
-    let start =
-        |id: &str, params: Value| json!({"id": id, "kind": "demo.fail", "params": params, "work": work.join(id)});
+    let start = |name: &str, params: Value| json!({"id": id(name), "kind": "demo.fail", "params": params, "work": work.join(name)});
     w.send(json!({"jsonrpc": "2.0", "id": 2, "method": "command.start", "params": start("r", json!({"how": "retry", "message": "later"}))}));
-    assert_eq!(w.notes("r", "failed").pop().unwrap()["params"], json!({"id": "r", "error": "later", "retry": true}));
+    assert_eq!(
+        w.notes("r", "failed").pop().unwrap()["params"],
+        json!({"id": id("r"), "error": "later", "retry": true})
+    );
     w.send(
         json!({"jsonrpc": "2.0", "id": 3, "method": "command.start", "params": start("f", json!({"message": "no"}))}),
     );
-    assert_eq!(w.notes("f", "failed").pop().unwrap()["params"], json!({"id": "f", "error": "no", "retry": false}));
+    assert_eq!(w.notes("f", "failed").pop().unwrap()["params"], json!({"id": id("f"), "error": "no"}));
 
-    w.send(json!({"jsonrpc": "2.0", "id": 4, "method": "command.start", "params": {"id": "u", "kind": "demo.nope"}}));
+    w.send(
+        json!({"jsonrpc": "2.0", "id": 4, "method": "command.start", "params": {"id": id("u"), "kind": "demo.nope"}}),
+    );
     assert_eq!(w.answer(4)["error"], json!({"code": -32000, "message": "demo.nope isn't a command of demo"}));
     w.send(json!({"jsonrpc": "2.0", "id": 5, "method": "no.such"}));
     assert_eq!(
@@ -186,8 +194,12 @@ fn failures_on_the_wire() {
     w.send(json!({"jsonrpc": "2.0", "method": "no.such"})); // a notification: no answer
     w.raw("this isn't JSON");
     w.raw("");
-    w.send(json!({"jsonrpc": "2.0", "id": 6, "method": "demo.ask", "params": {"fail": true}}));
+    w.send(json!({"jsonrpc": "2.0", "id": 6, "method": "mcp.call_tool", "params": {"name": "ask", "arguments": {"fail": true}}}));
     assert_eq!(w.answer(6)["error"], json!({"code": -32000, "message": "asked to fail"}));
+    // a newer node: a field this SDK doesn't know, and an enum value it doesn't know, are skipped
+    let newer = json!({"name": "ask", "arguments": {}, "fromANewerNode": true, "person": {"handle": "james", "kind": "KIND_NEW"}});
+    w.send(json!({"jsonrpc": "2.0", "id": 7, "method": "mcp.call_tool", "params": newer}));
+    assert!(w.answer(7)["result"]["result"]["params"].is_object());
     let (code, log) = w.exit(); // stdin closed: it exits
     assert_eq!(code, 0);
     assert!(log.contains("not JSON: this isn't JSON"), "{log}");
@@ -196,18 +208,19 @@ fn failures_on_the_wire() {
 #[test]
 fn its_requests_to_the_node_have_ids_and_get_answers() {
     let (mut w, work) = wire();
-    let start = json!({"id": "s", "kind": "demo.secret", "params": {"name": "demo.work", "prefix": "demo."}, "work": work.join("s")});
+    let start = json!({"id": id("s"), "kind": "demo.secret", "params": {"name": "demo.work", "prefix": "demo."}, "work": work.join("s")});
     w.send(json!({"jsonrpc": "2.0", "id": 2, "method": "command.start", "params": start}));
     let ask = w.next(|m| m["method"] == "secret.get");
     assert_eq!(ask, json!({"jsonrpc": "2.0", "id": "x1", "method": "secret.get", "params": {"name": "demo.work"}}));
     w.send(json!({"jsonrpc": "2.0", "id": "x1", "result": {"value": "w"}}));
     let list = w.next(|m| m["method"] == "secret.list");
     assert_eq!(list["id"], "x2");
+    assert_eq!(list["params"], json!({"prefix": "demo."}));
     w.send(json!({"jsonrpc": "2.0", "id": "x2", "result": {"names": ["demo.work"]}}));
     let done = w.notes("s", "done").pop().unwrap();
     assert_eq!(done["params"]["result"], json!({"value": "w", "names": ["demo.work"]}));
 
-    let refused = json!({"id": "t", "kind": "demo.secret", "params": {"name": "demo.x"}, "work": work.join("t")});
+    let refused = json!({"id": id("t"), "kind": "demo.secret", "params": {"name": "demo.x"}, "work": work.join("t")});
     w.send(json!({"jsonrpc": "2.0", "id": 3, "method": "command.start", "params": refused}));
     let ask = w.next(|m| m["method"] == "secret.get");
     w.send(json!({"jsonrpc": "2.0", "id": ask["id"], "error": {"code": -32000, "message": "not in its permissions"}}));

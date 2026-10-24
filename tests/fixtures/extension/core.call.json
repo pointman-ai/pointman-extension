@@ -1,0 +1,15 @@
+{
+  "method": "core.call",
+  "params": {
+    "method": "GET",
+    "path": "/v1/node/messages/19455",
+    "query": {}
+  },
+  "result": {
+    "status": 200,
+    "body": {
+      "id": 19455.0,
+      "deleted": false
+    }
+  }
+}

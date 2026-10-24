@@ -1,0 +1,9 @@
+{
+  "method": "pane.closed",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "reason": "the PR was merged"
+  }
+}

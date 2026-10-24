@@ -1,0 +1,23 @@
+{
+  "method": "session.prepare",
+  "params": {
+    "run": {
+      "value": "run_6296"
+    },
+    "handle": {
+      "handle": "loupe"
+    },
+    "client": "claude",
+    "folder": "/Users/me/Documents",
+    "model": "claude-opus-5-5",
+    "connectors": [
+      "github"
+    ]
+  },
+  "result": {
+    "env": {
+      "CLAUDE_CONFIG_DIR": "/Users/me/.claude-work"
+    },
+    "account": "work"
+  }
+}

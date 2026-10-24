@@ -1,0 +1,20 @@
+{
+  "method": "agents.join",
+  "params": {
+    "agent": {
+      "handle": "scene"
+    },
+    "pane": {
+      "value": "pane_12"
+    },
+    "instructions": "Keep it short.",
+    "effort": "EFFORT_LOW"
+  },
+  "result": {
+    "live": {
+      "value": "run_6296"
+    },
+    "voice": "Aria",
+    "voiceSpeed": 1.1
+  }
+}

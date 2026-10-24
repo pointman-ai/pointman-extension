@@ -1,0 +1,15 @@
+{
+  "method": "oauth.callback",
+  "params": {
+    "state": "s1",
+    "code": "c1",
+    "iss": "https://linear.app"
+  },
+  "result": {
+    "signedIn": true,
+    "person": {
+      "handle": "james"
+    },
+    "tools": 23
+  }
+}

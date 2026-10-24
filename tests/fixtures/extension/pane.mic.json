@@ -1,0 +1,11 @@
+{
+  "method": "pane.mic",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "seq": "41",
+    "capturedMs": "1792800000123",
+    "opus": "T3B1c0hlYWQ="
+  }
+}
