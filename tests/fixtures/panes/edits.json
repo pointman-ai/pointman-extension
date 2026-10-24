@@ -621,6 +621,51 @@
     }
    ],
    "refused": true
+  },
+  {
+   "title": "a table with more row ids than rows can't have a row put by one of the extra ids",
+   "content": {
+    "blocks": [
+     {
+      "name": "t",
+      "chart": {
+       "type": "TYPE_TABLE",
+       "data": {
+        "columns": [
+         "a"
+        ],
+        "rows": [
+         [
+          "x"
+         ]
+        ],
+        "rowIds": [
+         "r1",
+         "r2"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "putItems": {
+      "block": "t",
+      "items": [
+       {
+        "row": {
+         "id": "r2",
+         "cells": [
+          "Y"
+         ]
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "refused": true
   }
  ]
 }
