@@ -16,7 +16,10 @@
         "needs": [
           "ACTION_AUTH"
         ],
-        "why": "signed out"
+        "why": "signed out",
+        "person": {
+          "handle": "james"
+        }
       }
     ]
   }
