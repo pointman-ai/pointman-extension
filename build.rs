@@ -16,8 +16,13 @@ fn main() {
     println!("cargo:rerun-if-changed={}", set.display());
     let bytes = std::fs::read(&set).expect("proto/descriptors.pb is in the package");
     let fds = FileDescriptorSet::decode_from_slice(&bytes).expect("proto/descriptors.pb is a FileDescriptorSet");
-    let files: Vec<String> =
-        fds.file.iter().filter_map(|f| f.name.clone()).filter(|n| n.starts_with("pointman/")).collect();
+    // ours, and google.type's (a task's dates, google/type/date.proto), which buffa's well-known types don't have
+    let files: Vec<String> = fds
+        .file
+        .iter()
+        .filter_map(|f| f.name.clone())
+        .filter(|n| n.starts_with("pointman/") || n.starts_with("google/type/"))
+        .collect();
     assert!(files.iter().any(|f| f == PROTOCOL), "{PROTOCOL} isn't in {}", set.display());
     buffa_build::Config::new()
         .descriptor_set(&set)
