@@ -1,0 +1,3 @@
+What an extension's own proto may import beside its own files and google/protobuf's (the `proto` feature embeds them):
+buf/validate/validate.proto: pointman-ai/pointman 655f296f, proto/buf/validate/validate.proto (protovalidate's, Apache-2.0)
+pointman/v1/options.proto: pointman-ai/pointman 4b47e7e9 (pmcli/types-21), proto/pointman/v1/options.proto, for (pointman.v1.setting)

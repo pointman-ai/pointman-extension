@@ -1,6 +1,6 @@
 [package]
 name = "pointman-extension"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "The extension side of the Pointman node's extension protocol, and a stand-in node for tests"
@@ -19,6 +19,18 @@ anyhow = "1"
 serde = "1"
 serde_json = "1"
 toml = "1"
+# the `proto` feature: an extension's own proto (proto/<id>/v1/<id>.proto) made into its manifest's schemas and Rust types
+protox = { version = "0.10", optional = true }
+toml_edit = { version = "0.25", optional = true }
+buffa-build = { version = "0.9.2", optional = true }
+
+[features]
+proto = ["dep:protox", "dep:toml_edit", "dep:buffa-build"]
+
+[[bin]]
+name = "pointman-extension"
+path = "src/bin/pointman-extension.rs"
+required-features = ["proto"]
 
 [[example]]
 name = "hello"

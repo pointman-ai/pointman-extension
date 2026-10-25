@@ -59,12 +59,25 @@ pub mod blocks;
 pub mod convert;
 pub mod edits;
 mod pane;
+#[cfg(feature = "proto")]
+pub mod proto;
 pub mod testing;
+pub mod typed;
 
 /// buffa's code for the descriptors in `proto/descriptors.pb`: `pointman::extension::v1` (the protocol) and
 /// `pointman::v1` (blocks, panes, ids).
 pub mod types {
     include!(concat!(env!("OUT_DIR"), "/types.rs"));
+}
+
+/// The extension's own proto, as [`proto::build`](crate::proto) made it in its build script: buffa's types (a module
+/// per package: `youtube::v1::UploadParams`), and a [`typed::Typed`] and [`typed::Command`] for each. Use it in a module
+/// of its own: `mod proto { pointman_extension::include_proto!(); }`.
+#[macro_export]
+macro_rules! include_proto {
+    () => {
+        include!(concat!(env!("OUT_DIR"), "/pointman_proto.rs"));
+    };
 }
 
 /// The protocol's messages: `pointman.extension.v1`.
@@ -240,6 +253,11 @@ impl Handle {
     /// manifest defines them.
     pub fn settings(&self) -> Value {
         read(&self.0.settings).clone()
+    }
+
+    /// The settings as the extension's own `message Settings` ([`typed`]), with the manifest's defaults.
+    pub fn typed_settings<S: typed::Typed>(&self) -> anyhow::Result<S> {
+        typed::from_value(self.settings()).context("the settings")
     }
 
     /// What the node said about itself in `initialize`: its name, machine, work and state folders, roots.
@@ -590,6 +608,31 @@ impl Extension {
         let f: CommandFn = Arc::new(move |job: &Job| Ok(serde_json::to_value(f(job)?)?));
         self.commands.insert(kind.to_string(), f);
         self
+    }
+
+    /// Run `f` for the command whose params are `C` (the extension's own proto, [`typed`]): `f` gets them as that
+    /// message, with the defaults its manifest's params schema gives, and returns its result's. A params field the
+    /// schema requires fails the command when it's missing (`name is missing`), and so does a field the message
+    /// doesn't have or an enum's word it doesn't take, before `f` runs.
+    ///
+    /// # Panics
+    /// If `C::KIND` isn't one of extension.toml's `[[commands]]`.
+    pub fn typed_command<C, F>(&mut self, f: F) -> &mut Self
+    where
+        C: typed::Command,
+        F: Fn(&Job, C) -> anyhow::Result<C::Result> + Send + Sync + 'static,
+    {
+        let schema = self.manifest()["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|c| c["kind"] == C::KIND)
+            .map(|c| c["params"].clone())
+            .unwrap_or_default();
+        self.command(C::KIND, move |job: &Job| {
+            let params = typed::from_value::<C>(typed::with_schema(&schema, &job.params)?)?;
+            typed::to_value(&f(job, params)?)
+        })
     }
 
     /// Answer one of the node's requests beyond the ones the SDK answers (`HealthCheckRequest`,

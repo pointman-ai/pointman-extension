@@ -1,0 +1,119 @@
+// The kitchen extension: every rule an extension's own proto can say, and the schema each becomes (tests/manifest.rs).
+syntax = "proto3";
+
+package kitchen.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "pointman/v1/options.proto";
+
+// Uploads a video to the channel.
+message UploadParams {
+  // The video file: a board file or a path in the extension's folders.
+  string file = 1 [(buf.validate.field).required = true];
+  // The video's title, as viewers see it.
+  string title = 2 [(buf.validate.field).string = {min_len: 1, max_len: 100}];
+  string description = 3 [(buf.validate.field).string.max_len = 5000];  // Below the video.
+  // Words people search by.
+  repeated string tags = 4 [(buf.validate.field).repeated = {max_items: 30, unique: true, items: {string: {max_len: 30}}}];
+  // Who can watch it.
+  Privacy privacy = 5 [(pointman.v1.setting).default = "private"];
+  // When it goes public: RFC 3339.
+  google.protobuf.Timestamp publish_at = 6;
+  // For kids, as YouTube's law says.
+  optional bool made_for_kids = 7 [(pointman.v1.setting).default = "false"];
+  string language = 8 [(buf.validate.field).string = {len: 2, pattern: "^[a-z]{2}$"}];
+  // Its category's number.
+  int32 category = 9 [(buf.validate.field).int32 = {gte: 1, lte: 44}];
+  int64 size = 10 [(buf.validate.field).int64 = {gt: 0, lt: 137438953472}];
+  double volume = 11 [(buf.validate.field).double = {gte: 0, lte: 1}, (pointman.v1.setting).default = "0.5"];
+  float speed = 12 [(buf.validate.field).float = {gt: 0, lte: 4}];
+  uint32 copies = 13 [(buf.validate.field).uint32 = {in: [1, 2, 4]}];
+  string region = 14 [(buf.validate.field).string = {in: ["eu", "us"]}];
+  string slug = 15 [(buf.validate.field).string = {not_in: ["admin"]}];
+  string contact = 16 [(buf.validate.field).string.email = true];
+  string link = 17 [(buf.validate.field).string.uri = true];
+  // Where it was shot.
+  Place place = 18;
+  repeated Chapter chapters = 19 [(buf.validate.field).repeated.min_items = 1];
+  map<string, string> labels = 20 [(buf.validate.field).map = {max_pairs: 8, values: {string: {max_len: 20}}}];
+  google.protobuf.Duration length = 21;
+  google.protobuf.Struct extra = 22;
+  bytes cover = 23;
+  Privacy fallback = 24 [(buf.validate.field).enum = {defined_only: true, not_in: [3]}];
+  repeated Privacy allowed = 25 [(pointman.v1.setting).default = "public,unlisted"];
+  MadeForKids audience = 26 [(buf.validate.field).enum = {in: [1, 2]}];
+  // Where it goes after the upload: one of them, never both.
+  oneof destination {
+    option (buf.validate.oneof).required = true;
+    string playlist = 27;
+    bool drafts = 28;
+  }
+  map<string, Privacy> by_region = 29;
+  repeated int64 sizes = 30;
+  // Anything at all.
+  google.protobuf.Value anything = 31;
+}
+
+// What an upload made.
+message UploadResult {
+  string video = 1;
+  Privacy privacy = 2;
+  int64 views = 3;
+  repeated Privacy also = 4;
+  Place place = 5;
+  map<string, Privacy> by_region = 6;
+}
+
+// Who can watch a video.
+enum Privacy {
+  PRIVACY_UNSPECIFIED = 0;
+  PRIVACY_PRIVATE = 1;
+  PRIVACY_UNLISTED = 2;
+  PRIVACY_PUBLIC = 3;
+}
+
+enum MadeForKids {
+  MADE_FOR_KIDS_UNSPECIFIED = 0;
+  MADE_FOR_KIDS_YES = 1;
+  MADE_FOR_KIDS_NO = 2;
+  MADE_FOR_KIDS_NOT_SURE = 3;
+}
+
+// A place on the map.
+message Place {
+  string name = 1 [(buf.validate.field).required = true];
+  double lat = 2 [(buf.validate.field).double = {gte: -90, lte: 90}];
+  Privacy shown = 3;
+}
+
+message Chapter {
+  // From the start, in seconds.
+  uint32 at = 1;
+  string title = 2 [(buf.validate.field).string.min_len = 1];
+}
+
+message SetThumbnailParams {
+  // The video's id.
+  string video = 1 [(buf.validate.field).required = true];
+  string file = 2 [(buf.validate.field).required = true];
+}
+
+message SetThumbnailResult {}
+
+// Takes nothing.
+message PingParams {}
+
+// This machine's settings for the extension.
+message Settings {
+  // The channel to upload to, by its handle.
+  string channel = 1 [(buf.validate.field).string.pattern = "^@[A-Za-z0-9._-]{3,30}$"];
+  // Who can watch a new upload until someone says otherwise.
+  Privacy privacy = 2 [(pointman.v1.setting).default = "private"];
+  // How many uploads may run at once.
+  int32 uploads = 3 [(buf.validate.field).int32 = {gte: 1, lte: 4}, (pointman.v1.setting).default = "1"];
+  // Whether to notify subscribers.
+  bool notify = 4 [(pointman.v1.setting).default = "true"];
+}
