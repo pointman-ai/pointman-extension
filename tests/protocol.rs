@@ -62,8 +62,12 @@ impl Wire {
     }
 
     /// The next message (skipping the periodic task's events) that passes `test`; what's skipped
-    /// stays in `seen`.
+    /// stays in `seen`, and is taken from there when a later call wants it (a command's first note can come before
+    /// its answer).
     fn next(&mut self, test: impl Fn(&Value) -> bool) -> Value {
+        if let Some(i) = self.seen.iter().position(&test) {
+            return self.seen.remove(i);
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
