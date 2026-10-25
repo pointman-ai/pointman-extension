@@ -1,0 +1,10 @@
+{
+  "method": "agents.text",
+  "params": {
+    "live": {
+      "value": "run_6296"
+    },
+    "seq": "3",
+    "text": "Release 50 is"
+  }
+}

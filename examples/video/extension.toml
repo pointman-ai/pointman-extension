@@ -1,0 +1,20 @@
+# A video pane from the Rust SDK (Pointman's docs/dev/video.md): frames only while someone's watching,
+# at the rate the app's hint asks for. For the SDK's own tests (tests/video.rs), and to start one from.
+[extension]
+id = "video"
+name = "Video"
+version = "0.1.0"
+publisher = "aurelio"
+summary = "A video pane of made-up frames, for the Rust SDK's own tests."
+node = ">=0.1,<1"
+platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
+
+[run]
+command = ["bin/video"]
+runtime = "binary"
+
+[[panes]]
+id = "live"
+title = "Test card"
+format = "video"
+opens = ["menu", "command"]

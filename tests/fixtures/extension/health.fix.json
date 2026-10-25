@@ -1,0 +1,14 @@
+{
+  "method": "health.fix",
+  "params": {
+    "part": "james",
+    "action": "ACTION_AUTH",
+    "person": {
+      "handle": "james"
+    }
+  },
+  "result": {
+    "message": "Open the link to sign in",
+    "url": "https://linear.app/oauth/authorize?x=1"
+  }
+}

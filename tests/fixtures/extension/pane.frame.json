@@ -1,0 +1,12 @@
+{
+  "method": "pane.frame",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "capturedMs": "1792800000123",
+    "width": 1280,
+    "height": 720,
+    "jpeg": "/9j/4AAQ"
+  }
+}

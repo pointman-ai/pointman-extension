@@ -1,0 +1,671 @@
+{
+ "cases": [
+  {
+   "title": "insert first, after a block, and into a stack",
+   "content": {
+    "blocks": [
+     {
+      "name": "a",
+      "text": {
+       "markdown": "A"
+      }
+     },
+     {
+      "name": "s",
+      "layout": {
+       "stack": {}
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "insert": {
+      "block": {
+       "name": "z",
+       "text": {
+        "markdown": "Z"
+       }
+      }
+     }
+    },
+    {
+     "insert": {
+      "block": {
+       "name": "b",
+       "text": {
+        "markdown": "B"
+       }
+      },
+      "after": "a"
+     }
+    },
+    {
+     "insert": {
+      "block": {
+       "name": "c",
+       "text": {
+        "markdown": "C"
+       }
+      },
+      "parent": "s"
+     }
+    }
+   ],
+   "after": {
+    "blocks": [
+     {
+      "name": "z",
+      "text": {
+       "markdown": "Z"
+      }
+     },
+     {
+      "name": "a",
+      "text": {
+       "markdown": "A"
+      }
+     },
+     {
+      "name": "b",
+      "text": {
+       "markdown": "B"
+      }
+     },
+     {
+      "name": "s",
+      "layout": {
+       "stack": {
+        "children": [
+         {
+          "name": "c",
+          "text": {
+           "markdown": "C"
+          }
+         }
+        ]
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "title": "replace, remove and move by name, wherever the block is",
+   "content": {
+    "blocks": [
+     {
+      "name": "a",
+      "text": {
+       "markdown": "A"
+      }
+     },
+     {
+      "name": "s",
+      "layout": {
+       "stack": {
+        "children": [
+         {
+          "name": "b",
+          "text": {
+           "markdown": "B"
+          }
+         },
+         {
+          "name": "c",
+          "text": {
+           "markdown": "C"
+          }
+         }
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "replace": {
+      "block": {
+       "name": "b",
+       "text": {
+        "markdown": "B2"
+       }
+      }
+     }
+    },
+    {
+     "remove": "a"
+    },
+    {
+     "move": {
+      "block": "c",
+      "after": "s"
+     }
+    }
+   ],
+   "after": {
+    "blocks": [
+     {
+      "name": "s",
+      "layout": {
+       "stack": {
+        "children": [
+         {
+          "name": "b",
+          "text": {
+           "markdown": "B2"
+          }
+         }
+        ]
+       }
+      }
+     },
+     {
+      "name": "c",
+      "text": {
+       "markdown": "C"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "title": "a list's items put by id: replaced in place, new ones at the end; removed by id",
+   "content": {
+    "blocks": [
+     {
+      "name": "l",
+      "list": {
+       "style": "STYLE_ROWS",
+       "items": [
+        {
+         "id": "1",
+         "title": "one"
+        },
+        {
+         "id": "2",
+         "title": "two"
+        },
+        {
+         "id": "3",
+         "title": "three"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "putItems": {
+      "block": "l",
+      "items": [
+       {
+        "list": {
+         "id": "2",
+         "title": "TWO"
+        }
+       },
+       {
+        "list": {
+         "id": "4",
+         "title": "four"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "removeItems": {
+      "block": "l",
+      "ids": [
+       "1"
+      ]
+     }
+    }
+   ],
+   "after": {
+    "blocks": [
+     {
+      "name": "l",
+      "list": {
+       "style": "STYLE_ROWS",
+       "items": [
+        {
+         "id": "2",
+         "title": "TWO"
+        },
+        {
+         "id": "3",
+         "title": "three"
+        },
+        {
+         "id": "4",
+         "title": "four"
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  {
+   "title": "a waterfall's tick: its new and changed spans, then its own fields with its spans kept",
+   "content": {
+    "blocks": [
+     {
+      "name": "tr",
+      "view": {
+       "waterfall": {
+        "title": "Run",
+        "state": "STATE_LIVE",
+        "totals": {
+         "ms": "100"
+        },
+        "spans": [
+         {
+          "id": "l:1",
+          "kind": "KIND_LLM",
+          "name": "Model call",
+          "startMs": "10",
+          "state": "STATE_RUNNING"
+         }
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "putItems": {
+      "block": "tr",
+      "items": [
+       {
+        "span": {
+         "id": "l:1",
+         "kind": "KIND_LLM",
+         "name": "Model call",
+         "startMs": "10",
+         "endMs": "90",
+         "state": "STATE_OK"
+        }
+       },
+       {
+        "span": {
+         "id": "l:2",
+         "kind": "KIND_LLM",
+         "name": "Model call",
+         "startMs": "10",
+         "state": "STATE_RUNNING"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "replace": {
+      "block": {
+       "name": "tr",
+       "view": {
+        "waterfall": {
+         "title": "Run",
+         "state": "STATE_DONE",
+         "totals": {
+          "ms": "200"
+         }
+        }
+       }
+      },
+      "keepItems": true
+     }
+    }
+   ],
+   "after": {
+    "blocks": [
+     {
+      "name": "tr",
+      "view": {
+       "waterfall": {
+        "title": "Run",
+        "state": "STATE_DONE",
+        "totals": {
+         "ms": "200"
+        },
+        "spans": [
+         {
+          "id": "l:1",
+          "kind": "KIND_LLM",
+          "name": "Model call",
+          "startMs": "10",
+          "endMs": "90",
+          "state": "STATE_OK"
+         },
+         {
+          "id": "l:2",
+          "kind": "KIND_LLM",
+          "name": "Model call",
+          "startMs": "10",
+          "state": "STATE_RUNNING"
+         }
+        ]
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "title": "a table's rows by their ids",
+   "content": {
+    "blocks": [
+     {
+      "name": "t",
+      "chart": {
+       "type": "TYPE_TABLE",
+       "data": {
+        "columns": [
+         "a"
+        ],
+        "rows": [
+         [
+          "x"
+         ],
+         [
+          "y"
+         ]
+        ],
+        "rowIds": [
+         "r1",
+         "r2"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "putItems": {
+      "block": "t",
+      "items": [
+       {
+        "row": {
+         "id": "r2",
+         "cells": [
+          "Y"
+         ]
+        }
+       },
+       {
+        "row": {
+         "id": "r3",
+         "cells": [
+          "z"
+         ]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "removeItems": {
+      "block": "t",
+      "ids": [
+       "r1"
+      ]
+     }
+    }
+   ],
+   "after": {
+    "blocks": [
+     {
+      "name": "t",
+      "chart": {
+       "type": "TYPE_TABLE",
+       "data": {
+        "columns": [
+         "a"
+        ],
+        "rows": [
+         [
+          "Y"
+         ],
+         [
+          "z"
+         ]
+        ],
+        "rowIds": [
+         "r2",
+         "r3"
+        ]
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "title": "a board's items, with no block named",
+   "content": {
+    "board": {
+     "states": [],
+     "items": [
+      {
+       "title": "One",
+       "id": "MB-1"
+      },
+      {
+       "title": "Two",
+       "id": "MB-2"
+      }
+     ]
+    }
+   },
+   "edits": [
+    {
+     "putItems": {
+      "items": [
+       {
+        "board": {
+         "title": "One",
+         "id": "MB-1",
+         "state": "Done"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "removeItems": {
+      "ids": [
+       "MB-2"
+      ]
+     }
+    }
+   ],
+   "after": {
+    "board": {
+     "states": [],
+     "items": [
+      {
+       "title": "One",
+       "id": "MB-1",
+       "state": "Done"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "title": "all or none: a later edit naming a block that isn't there drops the list",
+   "content": {
+    "blocks": [
+     {
+      "name": "a",
+      "text": {
+       "markdown": "A"
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "remove": "a"
+    },
+    {
+     "replace": {
+      "block": {
+       "name": "nope",
+       "text": {
+        "markdown": "x"
+       }
+      }
+     }
+    }
+   ],
+   "refused": true
+  },
+  {
+   "title": "a name the pane has already can't be inserted again",
+   "content": {
+    "blocks": [
+     {
+      "name": "a",
+      "text": {
+       "markdown": "A"
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "insert": {
+      "block": {
+       "name": "a",
+       "text": {
+        "markdown": "again"
+       }
+      }
+     }
+    }
+   ],
+   "refused": true
+  },
+  {
+   "title": "an item of another kind than the block's",
+   "content": {
+    "blocks": [
+     {
+      "name": "l",
+      "list": {
+       "style": "STYLE_ROWS",
+       "items": [
+        {
+         "id": "1",
+         "title": "one"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "putItems": {
+      "block": "l",
+      "items": [
+       {
+        "span": {
+         "id": "l:1",
+         "kind": "KIND_LLM",
+         "name": "Model call",
+         "startMs": "10",
+         "state": "STATE_RUNNING"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "refused": true
+  },
+  {
+   "title": "a block can't move inside itself",
+   "content": {
+    "blocks": [
+     {
+      "name": "s",
+      "layout": {
+       "stack": {
+        "children": [
+         {
+          "name": "a",
+          "text": {
+           "markdown": "A"
+          }
+         }
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "move": {
+      "block": "s",
+      "parent": "s"
+     }
+    }
+   ],
+   "refused": true
+  },
+  {
+   "title": "a table with more row ids than rows can't have a row put by one of the extra ids",
+   "content": {
+    "blocks": [
+     {
+      "name": "t",
+      "chart": {
+       "type": "TYPE_TABLE",
+       "data": {
+        "columns": [
+         "a"
+        ],
+        "rows": [
+         [
+          "x"
+         ]
+        ],
+        "rowIds": [
+         "r1",
+         "r2"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "edits": [
+    {
+     "putItems": {
+      "block": "t",
+      "items": [
+       {
+        "row": {
+         "id": "r2",
+         "cells": [
+          "Y"
+         ]
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "refused": true
+  }
+ ]
+}

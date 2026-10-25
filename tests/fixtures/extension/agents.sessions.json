@@ -1,0 +1,19 @@
+{
+  "method": "agents.sessions",
+  "params": {},
+  "result": {
+    "agents": [
+      {
+        "handle": {
+          "handle": "shipwright"
+        },
+        "client": "claude",
+        "sessionId": "6c0f8d2e-1b7a-4c1e-9b9e-2f0a1d3e4b5c",
+        "thread": {
+          "value": "thr_5918"
+        },
+        "folder": "/Users/me/Documents"
+      }
+    ]
+  }
+}

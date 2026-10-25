@@ -1,0 +1,14 @@
+{
+  "method": "output",
+  "params": {
+    "id": {
+      "value": "req-412"
+    },
+    "path": "/w/resolve/req-412/cut.mov",
+    "kind": "video",
+    "role": "ROLE_MAIN",
+    "meta": {
+      "title": "Cut 3"
+    }
+  }
+}

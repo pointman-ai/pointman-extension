@@ -1,0 +1,14 @@
+{
+  "method": "oauth.start",
+  "params": {
+    "person": {
+      "handle": "james"
+    },
+    "redirectUri": "https://api.pointman.ai/v1/oauth/callback"
+  },
+  "result": {
+    "url": "https://linear.app/oauth/authorize?state=s1",
+    "state": "s1",
+    "expiresIn": 600
+  }
+}

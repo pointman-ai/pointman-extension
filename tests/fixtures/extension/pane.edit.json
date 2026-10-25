@@ -1,0 +1,72 @@
+{
+  "method": "pane.edit",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "edits": [
+      {
+        "putItems": {
+          "block": "tr",
+          "items": [
+            {
+              "span": {
+                "id": "l:2",
+                "parent": "r:5220",
+                "kind": "KIND_LLM",
+                "name": "Model call",
+                "startMs": "115000",
+                "state": "STATE_RUNNING"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "replace": {
+          "block": {
+            "name": "tr",
+            "view": {
+              "waterfall": {
+                "title": "Security check",
+                "state": "STATE_LIVE",
+                "totals": {
+                  "ms": "115000",
+                  "llmCalls": "2"
+                }
+              }
+            }
+          },
+          "keepItems": true
+        }
+      },
+      {
+        "remove": "old"
+      },
+      {
+        "insert": {
+          "block": {
+            "name": "note",
+            "text": {
+              "markdown": "Done."
+            }
+          },
+          "after": "count"
+        }
+      },
+      {
+        "move": {
+          "block": "note",
+          "parent": "side"
+        }
+      },
+      {
+        "removeItems": {
+          "ids": [
+            "MB-12"
+          ]
+        }
+      }
+    ]
+  }
+}

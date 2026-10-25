@@ -8,8 +8,62 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::bail;
+use buffa_types::google::protobuf::ListValue;
+use pointman_extension::protocol::PaneOpenResponse;
+use pointman_extension::v1::{
+    block::Family, chart, input, layout, list, Block, Chart, Input, Layout, List, PaneContext, PaneInput, Text, Tone,
+};
 use pointman_extension::{Extension, Handle, Pane, Refused};
-use serde_json::{json, Value};
+use serde_json::json;
+
+fn text(name: &str, markdown: &str) -> Block {
+    let family = Family::Text(Box::new(Text { markdown: markdown.into(), ..Default::default() }));
+    Block { name: Some(name.into()), family: Some(family), ..Default::default() }
+}
+
+fn stat(name: &str, label: &str, value: i64, tone: Tone) -> Block {
+    let data = chart::Data {
+        columns: vec!["value".into()],
+        rows: vec![ListValue::from_values([value as f64])],
+        ..Default::default()
+    };
+    let chart = Chart {
+        r#type: chart::Type::TYPE_STAT.into(),
+        title: label.into(),
+        data: data.into(),
+        tone: tone.into(),
+        ..Default::default()
+    };
+    Block { name: Some(name.into()), family: Some(Family::Chart(Box::new(chart))), ..Default::default() }
+}
+
+fn stack(name: &str, children: Vec<Block>) -> Block {
+    let stack = layout::Stack { children, ..Default::default() };
+    let layout = Layout { kind: Some(layout::Kind::Stack(Box::new(stack))), ..Default::default() };
+    Block { name: Some(name.into()), family: Some(Family::Layout(Box::new(layout))), ..Default::default() }
+}
+
+fn plus(name: &str) -> Block {
+    let button = input::actions::Button { id: "plus".into(), title: "+".into(), ..Default::default() };
+    let actions = input::Actions { buttons: vec![button], ..Default::default() };
+    let input = Input { kind: Some(input::Kind::Actions(Box::new(actions))), ..Default::default() };
+    Block { name: Some(name.into()), family: Some(Family::Input(Box::new(input))), ..Default::default() }
+}
+
+fn log(name: &str, ticks: u64) -> Block {
+    let items =
+        (1..=ticks).map(|i| list::Item { id: format!("t{i}"), title: format!("Tick {i}"), ..Default::default() });
+    let list = List { items: items.collect(), ..Default::default() };
+    Block { name: Some(name.into()), family: Some(Family::List(Box::new(list))), ..Default::default() }
+}
+
+fn tone(n: i64) -> Tone {
+    if n > 2 {
+        Tone::TONE_GOOD
+    } else {
+        Tone::TONE_UNSPECIFIED
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let mut ext = Extension::new()?;
@@ -19,27 +73,39 @@ fn main() -> anyhow::Result<()> {
             bail!("no such counter");
         }
         if pane.target()["bad"] == true {
-            return Ok(json!({"title": "Counter"}));
+            return Ok(PaneOpenResponse::default().titled("Counter"));
         }
         let start = pane.target()["start"].as_i64().unwrap_or(0);
         let n = Arc::new(AtomicI64::new(start));
+        let seen = Arc::new(Mutex::new("Looking at nothing".to_string()));
+        let view = {
+            let (n, seen) = (n.clone(), seen.clone());
+            move || {
+                let n = n.load(Ordering::SeqCst);
+                let seen = seen.lock().unwrap().clone();
+                vec![stack("top", vec![stat("count", "Taps", n, tone(n)), text("seen", &seen)]), plus("plus")]
+            }
+        };
 
-        let taps = n.clone();
-        pane.on_input(move |pane: &Pane, event: &Value| -> anyhow::Result<()> {
-            match event["block"].as_str().unwrap_or_default() {
+        let (taps, shows) = (n.clone(), view.clone());
+        pane.on_input(move |pane: &Pane, event: &PaneInput| -> anyhow::Result<()> {
+            match event.str("block").unwrap_or_default() {
                 "plus" => {
-                    let n = taps.fetch_add(1, Ordering::SeqCst) + 1;
-                    pane.update("count", json!({"value": n, "tone": if n > 2 { json!("good") } else { Value::Null }}));
+                    taps.fetch_add(1, Ordering::SeqCst);
+                    pane.show(shows());
                 }
                 "stop" => pane.close("stopped"),
-                "broken" => pane.patch(json!([{"op": "replace", "path": "/b/missing/value", "value": 1}])),
+                // an edit of a block that isn't there: the node would drop it
+                "broken" => pane.edit(vec![pointman_extension::edits::remove("missing")]),
                 _ => return Err(Refused::new("only + works here").into()),
             }
             Ok(())
         });
-        pane.on_context(|pane: &Pane, context: &Value| {
-            let thread = context["thread"].as_str().unwrap_or("nothing");
-            pane.update("seen", json!({"markdown": format!("Looking at {thread}")}));
+        let shows = view.clone();
+        pane.on_context(move |pane: &Pane, context: &PaneContext| {
+            let thread = context.thread.as_option().map_or("nothing", |t| t.value.as_str());
+            *seen.lock().unwrap() = format!("Looking at {thread}");
+            pane.show(shows());
         });
         let closing = n.clone();
         pane.on_close(move |pane: &Pane, reason: &str| {
@@ -48,11 +114,7 @@ fn main() -> anyhow::Result<()> {
         });
 
         pane.set_title(&format!("Counter from {start}")); // sent while opening: it follows the answer
-        Ok(json!({"title": "Counter", "blocks": [
-            {"type": "stack", "id": "top", "children": [
-                {"type": "stat", "id": "count", "label": "Taps", "value": start},
-                {"type": "text", "id": "seen", "markdown": "Looking at nothing"}]},
-            {"type": "actions", "id": "plus", "buttons": [{"id": "plus", "title": "+"}]}]}))
+        Ok(PaneOpenResponse::blocks(view()).titled("Counter"))
     });
 
     ext.pane("board", |pane: &Pane| {
@@ -63,39 +125,39 @@ fn main() -> anyhow::Result<()> {
                 {"id": "lin_1", "ref": "ALA-1", "title": "One", "state": "In Progress", "category": "active"},
                 {"id": "lin_parent", "ref": "ALA-2", "title": "Parent", "state": "In Progress", "category": "active"}]})));
         let now = board.clone();
-        pane.on_input(move |pane: &Pane, event: &Value| -> anyhow::Result<()> {
-            let kind = event["kind"].as_str().unwrap_or_default();
-            let item = event["item"].as_str().unwrap_or_default();
-            match kind {
+        pane.on_input(move |pane: &Pane, event: &PaneInput| -> anyhow::Result<()> {
+            let fields = event.json();
+            let item = event.str("item").unwrap_or_default();
+            match event.kind.as_str() {
                 "move" => {
-                    let to = event["to"].as_str().unwrap_or_default();
+                    let to = event.str("to").unwrap_or_default();
                     if item == "lin_parent" && to == "Done" {
                         bail!(Refused::new("Linear decides when parents close"));
                     }
                     let category = if to == "Done" { "done" } else { "active" };
-                    pane.update_item(item, json!({"state": to, "category": category}));
                     let mut board = now.lock().unwrap();
                     if let Some(it) = board["items"].as_array_mut().unwrap().iter_mut().find(|i| i["id"] == item) {
                         it["state"] = json!(to);
                         it["category"] = json!(category);
                     }
+                    pane.show_board(&board);
                 }
                 // an edit changes the tool's copy; show_board sends only what changed
                 "edit" => {
                     let mut board = now.lock().unwrap();
                     if let Some(it) = board["items"].as_array_mut().unwrap().iter_mut().find(|i| i["id"] == item) {
-                        if let Some(fields) = event["fields"].as_object() {
+                        if let Some(fields) = fields["fields"].as_object() {
                             it.as_object_mut().unwrap().extend(fields.clone());
                         }
                     }
-                    pane.show_board(&*board);
+                    pane.show_board(&board);
                 }
-                _ => bail!(Refused::new(format!("{kind} isn't something this board does"))),
+                kind => bail!(Refused::new(format!("{kind} isn't something this board does"))),
             }
             Ok(())
         });
         let first = board.lock().unwrap().clone();
-        Ok(json!({"title": "Spark", "board": first}))
+        Ok(PaneOpenResponse::board(&first).titled("Spark"))
     });
 
     // each tick shows all of the clock; show sends only what changed: the count, and the log's new row
@@ -107,20 +169,16 @@ fn main() -> anyhow::Result<()> {
             for pane in h.panes("clock") {
                 let n = ticks.entry(pane.id().to_string()).or_insert(0);
                 *n += 1;
-                let log: Vec<Value> =
-                    (1..=*n).map(|i| json!({"id": format!("t{i}"), "title": format!("Tick {i}")})).collect();
-                pane.show(json!([{"type": "stat", "id": "ticks", "label": "Ticks", "value": *n},
-                                 {"type": "list", "id": "log", "items": log}]));
+                pane.show(vec![stat("ticks", "Ticks", *n as i64, Tone::TONE_UNSPECIFIED), log("log", *n)]);
             }
         },
         "clock",
     );
     ext.pane("clock", |_pane: &Pane| {
-        Ok(json!({"blocks": [{"type": "stat", "id": "ticks", "label": "Ticks", "value": 0},
-                             {"type": "list", "id": "log", "items": []}]}))
+        Ok(PaneOpenResponse::blocks(vec![stat("ticks", "Ticks", 0, Tone::TONE_UNSPECIFIED), log("log", 0)]))
     });
 
-    ext.pane("page", |_pane: &Pane| Ok(json!({"title": "A page", "path": "pages/index.html"})));
+    ext.pane("page", |_pane: &Pane| Ok(PaneOpenResponse::page("pages/index.html").titled("A page")));
 
     ext.run()
 }

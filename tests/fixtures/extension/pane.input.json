@@ -1,0 +1,16 @@
+{
+  "method": "pane.input",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "seq": "5",
+    "event": {
+      "kind": "tap",
+      "fields": {
+        "block": "plus"
+      }
+    }
+  },
+  "result": {}
+}

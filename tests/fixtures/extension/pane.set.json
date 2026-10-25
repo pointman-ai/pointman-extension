@@ -1,0 +1,29 @@
+{
+  "method": "pane.set",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "content": {
+      "blocks": [
+        {
+          "name": "count",
+          "chart": {
+            "type": "TYPE_STAT",
+            "title": "Taps",
+            "data": {
+              "columns": [
+                "value"
+              ],
+              "rows": [
+                [
+                  3.0
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "method": "agents.tool",
+  "params": {
+    "live": {
+      "value": "run_6296"
+    },
+    "seq": "4",
+    "name": "Bash",
+    "state": "STATE_START"
+  }
+}

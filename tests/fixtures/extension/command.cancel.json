@@ -1,0 +1,11 @@
+{
+  "method": "command.cancel",
+  "params": {
+    "id": {
+      "value": "req-412"
+    }
+  },
+  "result": {
+    "found": true
+  }
+}

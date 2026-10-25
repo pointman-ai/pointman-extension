@@ -1,0 +1,26 @@
+{
+  "method": "health.check",
+  "params": {
+    "people": [
+      {
+        "handle": "james"
+      }
+    ]
+  },
+  "result": {
+    "parts": [
+      {
+        "id": "james",
+        "kind": "sign-in",
+        "state": "STATE_FAILING",
+        "needs": [
+          "ACTION_AUTH"
+        ],
+        "why": "signed out",
+        "person": {
+          "handle": "james"
+        }
+      }
+    ]
+  }
+}

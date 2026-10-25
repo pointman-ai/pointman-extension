@@ -3,8 +3,15 @@
 //! and stdout, with the log on stderr. The twin of the Python SDK (`mb_extension.py`), message for
 //! message.
 //!
+//! The protocol is `proto/pointman/extension/v1/protocol.proto` in Pointman's core repo (TYPES-9): each method's
+//! params and result are its messages, in protobuf's standard JSON. [`protocol`] holds them as Rust types (buffa
+//! builds them from [`proto/descriptors.pb`](https://github.com/pointman-ai/pointman-extension/tree/types/proto)),
+//! and [`v1`] the blocks, pane content and edits they carry. A method's name is its rpc's (`PaneOpen` is
+//! `pane.open`); an rpc that returns `Empty` is a notification. Lists stay open: a method, field or enum value this
+//! SDK doesn't know is skipped, never refused.
+//!
 //! ```no_run
-//! use pointman_extension::{Extension, Handle, Job, Retry};
+//! use pointman_extension::{Extension, Handle, Job, Retry, protocol::output_request::Role};
 //! use serde_json::json;
 //! use std::time::Duration;
 //!
@@ -16,7 +23,7 @@
 //!         if job.params["app"] == "closed" {
 //!             return Err(Retry::new("the app isn't open").into());
 //!         }
-//!         job.output(&out, "video", "main", json!({}));
+//!         job.output(&out, "video", Role::Main, json!({}));
 //!         Ok(json!({"frames": 250}))
 //!     });
 //!     ext.every(Duration::from_secs(10), |h: &Handle| h.event("demo.status", json!({"ok": true})), "demo");
@@ -26,7 +33,7 @@
 //!
 //! Commands in the same lane run one at a time, on the lane's own thread, with its periodic tasks
 //! between them (an app's API that must only ever be driven from one thread). A command with no
-//! lane gets a thread of its own, and so does each of the node's requests to a [`Extension::method`].
+//! lane gets a thread of its own, and so does each of the node's requests to an [`Extension::on`].
 //!
 //! Panes ([`Extension::pane`], [`Pane`]): the extension answers `pane.open` for each of its
 //! manifest's `[[panes]]` with the first content, then keeps it current; each pane's open, inputs,
@@ -44,20 +51,87 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+pub mod blocks;
+pub mod convert;
+pub mod edits;
 mod pane;
 pub mod testing;
 
-pub use pane::{board_changes, changes, pointer, Pane, Refused};
+/// buffa's code for the descriptors in `proto/descriptors.pb`: `pointman::extension::v1` (the protocol) and
+/// `pointman::v1` (blocks, panes, ids).
+pub mod types {
+    include!(concat!(env!("OUT_DIR"), "/types.rs"));
+}
 
-/// The protocol version this SDK speaks.
-pub const PROTOCOL: u64 = 1;
+/// The protocol's messages: `pointman.extension.v1`.
+pub use types::pointman::extension::v1 as protocol;
+/// Blocks, pane content and edits, ids: `pointman.v1`.
+pub use types::pointman::v1;
+
+pub use pane::{Pane, Refused, AUDIO_MAX, SEALING, VIDEO_FRAME_MAX};
+
+use protocol::{
+    CheckpointRequest, CommandCancelRequest, CommandCancelResponse, CommandId, CommandStartRequest,
+    CommandStartResponse, DoneRequest, EventRequest, FailedRequest, InitializeRequest, InitializeResponse,
+    OutputRequest, ProgressRequest, SecretGetRequest, SecretListRequest, ShutdownResponse,
+};
+
+/// The protocol version this SDK speaks: `PROTOCOL_TYPED`, the messages in standard JSON.
+pub const PROTOCOL: protocol::Protocol = protocol::Protocol::PROTOCOL_TYPED;
 /// Where extension.toml is (the file or its folder), when it isn't in the working folder or in
 /// the folder above the binary's.
 pub const MANIFEST_ENV: &str = "POINTMAN_EXTENSION_MANIFEST";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ------------------------------------------------------------------ the protocol's methods
+
+/// Who answers a method: the extension (`ExtensionProcessService`) or the node (`ExtensionHostService`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// The node asks, the extension answers.
+    Process,
+    /// The extension asks, the node answers.
+    Host,
+}
+
+/// A request message: its method, who answers it, and the message that answers.
+pub trait Request: Serialize + DeserializeOwned {
+    const METHOD: &'static str;
+    const SIDE: Side;
+    type Response: Serialize + DeserializeOwned;
+}
+
+/// A notification message: sent with no id, never answered.
+pub trait Notification: Serialize + DeserializeOwned {
+    const METHOD: &'static str;
+    const SIDE: Side;
+}
+
+type RoundTrip = fn(&Value) -> Result<Value, String>;
+
+/// One method of the protocol, for tools and tests: its name, and each side's message read and written again
+/// (`round_trip.0` the params, `.1` the result; notifications have none).
+pub struct Info {
+    pub method: &'static str,
+    pub notification: bool,
+    pub side: Side,
+    pub round_trip: (RoundTrip, RoundTrip),
+}
+
+fn rt<T: Serialize + DeserializeOwned>(json: &Value) -> Result<Value, String> {
+    let message: T = from_json(json.clone()).map_err(|e| e.to_string())?;
+    serde_json::to_value(message).map_err(|e| e.to_string())
+}
+
+fn none(_: &Value) -> Result<Value, String> {
+    Ok(Value::Null)
+}
+
+include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
 /// Fail this command, but say it's worth trying again later (the app isn't open, say):
 /// `return Err(Retry::new("Resolve isn't open").into())` sends `failed` with `retry: true`.
@@ -91,8 +165,7 @@ impl fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-/// What an `on_start`, `on_settings` or `every` callback may return: nothing, or a `Result`. An
-/// error is logged, and `on_settings`'s is the node's answer.
+/// What an `on_start` or `every` callback may return: nothing, or a `Result`. An error is logged.
 pub trait Outcome {
     fn into_result(self) -> anyhow::Result<()>;
 }
@@ -113,6 +186,20 @@ type CommandFn = Arc<dyn Fn(&Job) -> anyhow::Result<Value> + Send + Sync>;
 type MethodFn = Arc<dyn Fn(Value) -> anyhow::Result<Value> + Send + Sync>;
 type HookFn = Arc<dyn Fn(&Handle) -> anyhow::Result<()> + Send + Sync>;
 
+/// What the SDK answers itself: an [`Extension::on`] can't take these.
+const OWN: [&str; 10] = [
+    "initialize",
+    "shutdown",
+    "command.start",
+    "command.cancel",
+    "pane.open",
+    "pane.input",
+    "pane.context",
+    "pane.close",
+    "pane.viewers",
+    "pane.control",
+];
+
 // ------------------------------------------------------------------ talking to the node
 
 struct Shared {
@@ -120,7 +207,7 @@ struct Shared {
     version: String,
     manifest: Value,
     settings: RwLock<Value>,
-    node: RwLock<Value>,
+    node: RwLock<InitializeRequest>,
     events: Mutex<HashMap<String, Value>>,
     answers: Mutex<HashMap<String, Sender<Result<Value, String>>>>,
     calls: AtomicU64,
@@ -149,15 +236,29 @@ impl Handle {
         &self.0.manifest
     }
 
-    /// This machine's settings for it, with the defaults from the manifest's `[settings]` schema.
+    /// This machine's settings for it, with the defaults from the manifest's `[settings]` schema. Free-form: the
+    /// manifest defines them.
     pub fn settings(&self) -> Value {
         read(&self.0.settings).clone()
     }
 
-    /// What the node said about itself in `initialize`: `protocol`, `node`, `machine`, `work_dir`,
-    /// `state_dir` and `roots`.
-    pub fn node(&self) -> Value {
+    /// What the node said about itself in `initialize`: its name, machine, work and state folders, roots.
+    pub fn node(&self) -> InitializeRequest {
         read(&self.0.node).clone()
+    }
+
+    /// The machine's name (`this machine` before the node has said).
+    pub fn machine(&self) -> String {
+        let node = read(&self.0.node);
+        match node.machine.as_option().map(|m| m.value.as_str()).filter(|m| !m.is_empty()) {
+            Some(machine) => machine.to_string(),
+            None => "this machine".to_string(),
+        }
+    }
+
+    /// The extension's own state folder, kept across versions.
+    pub fn state_dir(&self) -> PathBuf {
+        PathBuf::from(&read(&self.0.node).state_dir)
     }
 
     /// The panes open now, of one of the manifest's `[[panes]]` (every one, for `""`), once their open
@@ -172,9 +273,13 @@ impl Handle {
         eprintln!("{message}");
     }
 
-    /// Send a notification to the node.
-    pub fn notify(&self, method: &str, params: Value) {
-        self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}));
+    /// Send a notification to the node (`ProgressRequest`, `PaneTitleRequest`…).
+    ///
+    /// # Panics
+    /// If `N` is a message the node sends, not one it takes.
+    pub fn notify<N: Notification>(&self, params: &N) {
+        assert!(N::SIDE == Side::Host, "{} is one of the node's notifications, not the extension's", N::METHOD);
+        self.send(&json!({"jsonrpc": "2.0", "method": N::METHOD, "params": to_json(params)}));
     }
 
     /// Report status. Sent only when it changed since the last time.
@@ -192,38 +297,49 @@ impl Handle {
             return;
         }
         events.insert(name.to_string(), data.clone());
-        self.notify("event", json!({"name": name, "data": data}));
+        self.notify(&EventRequest {
+            name: name.to_string(),
+            data: convert::to_struct(&data).into(),
+            ..Default::default()
+        });
     }
 
-    /// Ask the node something (`secret.list`, `oauth.load`), and wait up to 30 s for its answer.
+    /// Ask the node something (`SecretListRequest`, `OauthLoadRequest`…), and wait up to 30 s for its answer.
     /// An error carries the node's reason.
-    pub fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        self.request_timeout(method, params, REQUEST_TIMEOUT)
+    pub fn request<R: Request>(&self, params: &R) -> anyhow::Result<R::Response> {
+        self.request_timeout(params, REQUEST_TIMEOUT)
     }
 
-    pub fn request_timeout(&self, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
+    pub fn request_timeout<R: Request>(&self, params: &R, timeout: Duration) -> anyhow::Result<R::Response> {
+        assert!(R::SIDE == Side::Host, "{} is one of the node's requests, not the extension's", R::METHOD);
         let rid = format!("x{}", self.0.calls.fetch_add(1, Ordering::SeqCst) + 1);
         let (tx, rx) = mpsc::channel();
         lock(&self.0.answers).insert(rid.clone(), tx);
-        self.send(&json!({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}));
+        self.send(&json!({"jsonrpc": "2.0", "id": rid, "method": R::METHOD, "params": to_json(params)}));
         let answer = rx.recv_timeout(timeout);
         lock(&self.0.answers).remove(&rid);
-        match answer {
-            Err(_) => bail!("the node didn't answer {method}"),
-            Ok(Err(reason)) => Err(anyhow!(reason)),
-            Ok(Ok(Value::Null)) => Ok(json!({})),
-            Ok(Ok(result)) => Ok(result),
-        }
+        let result = match answer {
+            Err(_) => bail!("the node didn't answer {}", R::METHOD),
+            Ok(Err(reason)) => return Err(anyhow!(reason)),
+            Ok(Ok(Value::Null)) => json!({}),
+            Ok(Ok(result)) => result,
+        };
+        from_json(result).with_context(|| format!("the node's answer to {} isn't its message", R::METHOD))
     }
 
     /// A vault secret this extension may use (one `permissions.secrets` names or covers), opened by
     /// the node when it's needed. Never kept in settings or on disk.
     pub fn secret(&self, name: &str) -> anyhow::Result<String> {
-        let answer = self.request("secret.get", json!({"name": name}))?;
-        match answer.get("value") {
-            Some(Value::String(value)) => Ok(value.clone()),
-            _ => bail!("the node gave no value for the secret {name}"),
+        let answer = self.request(&SecretGetRequest { name: name.to_string(), ..Default::default() })?;
+        if answer.value.is_empty() {
+            bail!("the node gave no value for the secret {name}");
         }
+        Ok(answer.value)
+    }
+
+    /// The names of the vault's items under a prefix its permissions cover, sorted.
+    pub fn secrets(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self.request(&SecretListRequest { prefix: prefix.to_string(), ..Default::default() })?.names)
     }
 
     /// A path a command was given, resolved, if it's inside a folder the node allows (its roots,
@@ -232,12 +348,8 @@ impl Handle {
         let given = path.as_ref();
         let resolved = resolve(given);
         let node = self.node();
-        let mut roots: Vec<&str> = node
-            .get("roots")
-            .and_then(Value::as_array)
-            .map(|roots| roots.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        roots.extend(["work_dir", "state_dir"].iter().filter_map(|k| node.get(*k).and_then(Value::as_str)));
+        let mut roots: Vec<&str> = node.roots.iter().map(String::as_str).collect();
+        roots.extend([node.work_dir.as_str(), node.state_dir.as_str()]);
         if roots.iter().filter(|r| !r.is_empty()).any(|r| resolved.starts_with(resolve(Path::new(r)))) {
             return Ok(resolved);
         }
@@ -280,6 +392,7 @@ impl Handle {
 pub struct Job {
     pub id: String,
     pub kind: String,
+    /// What the command was given, as its manifest's params say (free-form: a `Struct` on the wire).
     pub params: Value,
     /// Its own folder, for what it makes.
     pub work: PathBuf,
@@ -303,6 +416,10 @@ impl fmt::Debug for Job {
 }
 
 impl Job {
+    fn command_id(&self) -> CommandId {
+        CommandId { value: self.id.clone(), ..Default::default() }
+    }
+
     /// Whether the node has cancelled it.
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
@@ -328,23 +445,37 @@ impl Job {
         stage: impl Into<Option<&'a str>>,
         detail: Value,
     ) {
-        let (fraction, stage): (Option<f64>, Option<&str>) = (fraction.into(), stage.into());
-        let detail = if detail.is_null() { json!({}) } else { detail };
-        self.handle.notify("progress", json!({"id": self.id, "fraction": fraction, "stage": stage, "detail": detail}));
+        self.handle.notify(&ProgressRequest {
+            id: self.command_id().into(),
+            fraction: fraction.into(),
+            stage: stage.into().map(String::from),
+            detail: convert::to_struct(&detail).into(),
+            ..Default::default()
+        });
     }
 
     /// A checkpoint: given back as `job.checkpoint` if the command restarts.
     pub fn save(&self, state: impl Serialize) {
-        self.handle.notify("checkpoint", json!({"id": self.id, "state": to_json(state)}));
+        let state = convert::to_proto(&to_json(state));
+        self.handle.notify(&CheckpointRequest {
+            id: self.command_id().into(),
+            state: state.into(),
+            ..Default::default()
+        });
     }
 
-    /// A file it made, for the node to publish: `kind` is an output kind (`video`, `image`…),
-    /// `role` is `main`, `proxy`, `poster`, `thumb` or `contact_sheet`.
-    pub fn output(&self, path: impl AsRef<Path>, kind: &str, role: &str, meta: Value) {
-        let role = if role.is_empty() { "main" } else { role };
-        let meta = if meta.is_null() { json!({}) } else { meta };
-        let path = path.as_ref().to_string_lossy();
-        self.handle.notify("output", json!({"id": self.id, "path": path, "kind": kind, "role": role, "meta": meta}));
+    /// A file it made, for the node to publish: `kind` is an output kind (`video`, `image`…), `role` is
+    /// [`Role::Main`](protocol::output_request::Role) (the one the node publishes), `Proxy`, `Poster`, `Thumb` or
+    /// `ContactSheet`.
+    pub fn output(&self, path: impl AsRef<Path>, kind: &str, role: protocol::output_request::Role, meta: Value) {
+        self.handle.notify(&OutputRequest {
+            id: self.command_id().into(),
+            path: path.as_ref().to_string_lossy().into_owned(),
+            kind: kind.to_string(),
+            role: role.into(),
+            meta: convert::to_struct(&meta).into(),
+            ..Default::default()
+        });
     }
 
     /// The extension's [`Handle`], for events and secrets inside a command.
@@ -362,9 +493,8 @@ pub struct Extension {
     commands: HashMap<String, CommandFn>,
     pane_formats: HashMap<String, Option<String>>,
     openers: HashMap<String, pane::OpenFn>,
-    methods: HashMap<String, MethodFn>,
+    methods: HashMap<&'static str, MethodFn>,
     on_start: Vec<HookFn>,
-    on_settings: Vec<HookFn>,
     periodic: HashMap<String, Vec<(Duration, HookFn)>>,
     jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     queues: Mutex<HashMap<String, Sender<Job>>>,
@@ -410,7 +540,7 @@ impl Extension {
             version,
             manifest,
             settings: RwLock::new(json!({})),
-            node: RwLock::new(json!({})),
+            node: RwLock::new(InitializeRequest::default()),
             events: Mutex::default(),
             answers: Mutex::default(),
             calls: AtomicU64::new(0),
@@ -424,7 +554,6 @@ impl Extension {
             openers: HashMap::new(),
             methods: HashMap::new(),
             on_start: Vec::new(),
-            on_settings: Vec::new(),
             periodic: HashMap::new(),
             jobs: Mutex::default(),
             queues: Mutex::default(),
@@ -463,32 +592,59 @@ impl Extension {
         self
     }
 
-    /// Answer one of the node's requests beyond commands (an `mcp` extension's `mcp.call_tool`,
-    /// `session.prepare`). Each runs on a thread of its own, so a slow one never holds up the rest.
-    pub fn method<F, R>(&mut self, name: &str, f: F) -> &mut Self
+    /// Answer one of the node's requests beyond the ones the SDK answers (`HealthCheckRequest`,
+    /// `McpCallToolRequest`, `SessionPrepareRequest`…): `f` gets the request and gives the answer's message. Each runs
+    /// on a thread of its own, so a slow one never holds up the rest.
+    ///
+    /// # Panics
+    /// If `R` is one of the extension's own requests, or one the extension sends.
+    pub fn on<R, F>(&mut self, f: F) -> &mut Self
     where
-        F: Fn(Value) -> anyhow::Result<R> + Send + Sync + 'static,
-        R: Serialize,
+        R: Request,
+        F: Fn(R) -> anyhow::Result<R::Response> + Send + Sync + 'static,
     {
-        let f: MethodFn = Arc::new(move |params| Ok(serde_json::to_value(f(params)?)?));
-        self.methods.insert(name.to_string(), f);
+        assert!(R::SIDE == Side::Process, "{} is one of the extension's requests to the node", R::METHOD);
+        assert!(!OWN.contains(&R::METHOD), "the SDK answers {} itself", R::METHOD);
+        let f: MethodFn = Arc::new(move |params| {
+            let request: R = from_json(params).context("the request isn't its message")?;
+            Ok(serde_json::to_value(f(request)?)?)
+        });
+        self.methods.insert(R::METHOD, f);
         self
     }
 
-    /// Open one of the manifest's `[[panes]]`: `f(pane)` returns its first content, `{"title": …,
-    /// "blocks": […]}` (or `"board": {…}`, or a page's `"path"`), and the format comes from the
-    /// manifest. An error is the node's answer, and the pane doesn't open.
+    /// Take one of the node's notifications (`AgentsTextRequest`, `PaneViewersRequest`…).
+    ///
+    /// # Panics
+    /// If `N` is one of the extension's own notifications, or one the extension sends.
+    pub fn on_notice<N, F>(&mut self, f: F) -> &mut Self
+    where
+        N: Notification,
+        F: Fn(N) -> anyhow::Result<()> + Send + Sync + 'static,
+    {
+        assert!(N::SIDE == Side::Process, "{} is one of the extension's notifications to the node", N::METHOD);
+        assert!(!OWN.contains(&N::METHOD), "the SDK takes {} itself", N::METHOD);
+        let f: MethodFn = Arc::new(move |params| {
+            let notice: N = from_json(params).context("the notification isn't its message")?;
+            f(notice)?;
+            Ok(Value::Null)
+        });
+        self.methods.insert(N::METHOD, f);
+        self
+    }
+
+    /// Open one of the manifest's `[[panes]]`: `f(pane)` returns its first content (a [`PaneOpenResponse`](
+    /// protocol::PaneOpenResponse): [`blocks`](protocol::PaneOpenResponse::blocks), `board` or `page`), and the
+    /// format comes from the manifest. An error is the node's answer, and the pane doesn't open.
     ///
     /// # Panics
     /// If `id` isn't one of extension.toml's `[[panes]]`.
-    pub fn pane<F, R>(&mut self, id: &str, f: F) -> &mut Self
+    pub fn pane<F>(&mut self, id: &str, f: F) -> &mut Self
     where
-        F: Fn(&Pane) -> anyhow::Result<R> + Send + Sync + 'static,
-        R: Serialize,
+        F: Fn(&Pane) -> anyhow::Result<protocol::PaneOpenResponse> + Send + Sync + 'static,
     {
         assert!(self.pane_formats.contains_key(id), "{id} isn't a pane in extension.toml");
-        let f: pane::OpenFn = Arc::new(move |pane: &Pane| Ok(serde_json::to_value(f(pane)?)?));
-        self.openers.insert(id.to_string(), f);
+        self.openers.insert(id.to_string(), Arc::new(f));
         self
     }
 
@@ -504,16 +660,6 @@ impl Extension {
         R: Outcome,
     {
         self.on_start.push(hook(f));
-        self
-    }
-
-    /// Called when this machine's settings change (`h.settings()` has the new ones).
-    pub fn on_settings<F, R>(&mut self, f: F) -> &mut Self
-    where
-        F: Fn(&Handle) -> R + Send + Sync + 'static,
-        R: Outcome,
-    {
-        self.on_settings.push(hook(f));
         self
     }
 
@@ -570,33 +716,38 @@ impl Extension {
             None | Some(Value::Null) => json!({}),
             Some(p) => p.clone(),
         };
-        if let Some(f) = self.methods.get(&method).cloned() {
+        if let Some(f) = self.methods.get(method.as_str()).cloned() {
             let h = self.handle.clone();
             spawn(format!("method-{method}"), move || {
                 let result = guarded(|| f(params));
-                if let Some(rid) = rid {
-                    h.reply(rid, result);
+                match (rid, result) {
+                    (Some(rid), result) => h.reply(rid, result),
+                    (None, Err(e)) => h.log(format!("{method}: {e:#}")),
+                    (None, Ok(_)) => {}
                 }
             });
             return true;
         }
-        if matches!(method.as_str(), "pane.open" | "pane.input" | "pane.context" | "pane.close") {
+        if matches!(
+            method.as_str(),
+            "pane.open" | "pane.input" | "pane.context" | "pane.viewers" | "pane.control" | "pane.close"
+        ) {
             let opener = match method.as_str() {
                 "pane.open" => params["open"].as_str().and_then(|open| {
                     Some((self.openers.get(open)?.clone(), self.pane_formats.get(open).cloned().flatten()))
                 }),
                 _ => None,
             };
-            pane::message(&self.handle, &method, &params, rid, opener);
+            pane::message(&self.handle, &method, params, rid, opener);
             return true;
         }
         let result = match method.as_str() {
-            "initialize" => self.initialize(&params),
-            "command.start" => self.start(&params),
-            "command.cancel" => self.cancel(&params),
-            "settings.changed" => self.settings_changed(&params),
-            "shutdown" => Ok(json!({})),
+            "initialize" => self.initialize(params),
+            "command.start" => self.start(params),
+            "command.cancel" => self.cancel(params),
+            "shutdown" => Ok(to_json(ShutdownResponse::default())),
             _ => {
+                // an unknown method is skipped; a request is told so
                 if let Some(rid) = rid {
                     let error = json!({"code": -32601, "message": format!("no method {method}")});
                     self.handle.send(&json!({"jsonrpc": "2.0", "id": rid, "error": error}));
@@ -610,13 +761,10 @@ impl Extension {
         method != "shutdown"
     }
 
-    fn initialize(self: &Arc<Self>, p: &Value) -> anyhow::Result<Value> {
-        let node: Map<String, Value> = ["protocol", "node", "machine", "work_dir", "state_dir", "roots"]
-            .iter()
-            .map(|k| (k.to_string(), p.get(*k).cloned().unwrap_or(Value::Null)))
-            .collect();
-        *write(&self.handle.0.node) = Value::Object(node);
-        *write(&self.handle.0.settings) = self.with_defaults(p.get("settings"));
+    fn initialize(self: &Arc<Self>, params: Value) -> anyhow::Result<Value> {
+        let hello: InitializeRequest = from_params(params, "initialize")?;
+        *write(&self.handle.0.settings) = self.with_defaults(Some(&convert::from_struct(&hello.settings)));
+        *write(&self.handle.0.node) = hello;
         for lane in self.periodic.keys() {
             self.lane(lane);
         }
@@ -628,7 +776,12 @@ impl Extension {
                 }
             }
         });
-        Ok(json!({"protocol": PROTOCOL, "id": self.handle.0.id, "version": self.handle.0.version}))
+        Ok(to_json(InitializeResponse {
+            protocol: PROTOCOL.into(),
+            id: self.handle.0.id.clone(),
+            version: self.handle.0.version.clone(),
+            ..Default::default()
+        }))
     }
 
     fn with_defaults(&self, given: Option<&Value>) -> Value {
@@ -646,23 +799,23 @@ impl Extension {
         Value::Object(out)
     }
 
-    fn start(self: &Arc<Self>, p: &Value) -> anyhow::Result<Value> {
-        let kind = p.get("kind").and_then(Value::as_str).context("command.start has no kind")?;
+    fn start(self: &Arc<Self>, params: Value) -> anyhow::Result<Value> {
+        let p: CommandStartRequest = from_params(params, "command.start")?;
+        let kind = p.kind.as_str();
         if !self.commands.contains_key(kind) {
             bail!("{kind} isn't a command of {}", self.handle.0.id);
         }
-        let cid = p.get("id").filter(|id| !id.is_null()).map(id_text).context("command.start has no id")?;
+        let cid =
+            p.id.as_option()
+                .map(|id| id.value.clone())
+                .filter(|id| !id.is_empty())
+                .context("command.start has no id")?;
         let mut jobs = lock(&self.jobs);
         if jobs.contains_key(&cid) {
-            return Ok(json!({"accepted": true, "already": true}));
+            return Ok(to_json(CommandStartResponse { already: true, ..Default::default() }));
         }
-        let node_work = self.handle.node()["work_dir"].as_str().map(String::from);
-        let work = p
-            .get("work")
-            .and_then(Value::as_str)
-            .map(String::from)
+        let work = [p.work.clone(), self.handle.node().work_dir]
             .into_iter()
-            .chain(node_work)
             .find(|w| !w.is_empty())
             .unwrap_or_else(|| ".".into());
         let work = PathBuf::from(work);
@@ -673,12 +826,9 @@ impl Extension {
         let job = Job {
             id: cid.clone(),
             kind: kind.to_string(),
-            params: match p.get("params") {
-                None | Some(Value::Null) => json!({}),
-                Some(params) => params.clone(),
-            },
+            params: convert::from_struct(&p.params),
             work,
-            checkpoint: p.get("checkpoint").filter(|c| !c.is_null()).cloned(),
+            checkpoint: p.checkpoint.as_option().map(convert::from_proto).filter(|c| !c.is_null()),
             cancel,
             handle: self.handle.clone(),
         };
@@ -691,21 +841,14 @@ impl Extension {
                 spawn(format!("cmd-{cid}"), move || ext.execute(job));
             }
         }
-        Ok(json!({"accepted": true}))
+        Ok(to_json(CommandStartResponse::default()))
     }
 
-    fn cancel(&self, p: &Value) -> anyhow::Result<Value> {
-        let cid = p.get("id").map(id_text).context("command.cancel has no id")?;
+    fn cancel(&self, params: Value) -> anyhow::Result<Value> {
+        let p: CommandCancelRequest = from_params(params, "command.cancel")?;
+        let cid = p.id.as_option().map(|id| id.value.clone()).context("command.cancel has no id")?;
         let found = lock(&self.jobs).get(&cid).map(|c| c.store(true, Ordering::SeqCst)).is_some();
-        Ok(json!({"found": found}))
-    }
-
-    fn settings_changed(&self, p: &Value) -> anyhow::Result<Value> {
-        *write(&self.handle.0.settings) = self.with_defaults(p.get("settings"));
-        for f in &self.on_settings {
-            guarded(|| f(&self.handle))?;
-        }
-        Ok(json!({}))
+        Ok(to_json(CommandCancelResponse { found, ..Default::default() }))
     }
 
     /// The lane's queue, and its thread, started the first time it's needed.
@@ -756,21 +899,29 @@ impl Extension {
             let f = self.commands[&job.kind].clone();
             guarded(|| f(&job))
         };
-        let (h, id) = (&self.handle, &job.id);
+        let h = &self.handle;
+        let id = job.command_id();
+        let failed = |error: String, retry: bool, cancelled: bool| FailedRequest {
+            id: id.clone().into(),
+            error,
+            retry,
+            cancelled,
+            ..Default::default()
+        };
         match outcome {
-            Ok(result) => h.notify("done", json!({"id": id, "result": result})),
-            Err(e) if caused_by::<Cancelled>(&e) => {
-                h.notify("failed", json!({"id": id, "error": "cancelled", "retry": false, "cancelled": true}))
-            }
-            Err(e) if caused_by::<Retry>(&e) => {
-                h.notify("failed", json!({"id": id, "error": text_or(&e, "try again later"), "retry": true}))
-            }
+            Ok(result) => h.notify(&DoneRequest {
+                id: id.clone().into(),
+                result: convert::to_proto(&result).into(),
+                ..Default::default()
+            }),
+            Err(e) if caused_by::<Cancelled>(&e) => h.notify(&failed("cancelled".into(), false, true)),
+            Err(e) if caused_by::<Retry>(&e) => h.notify(&failed(text_or(&e, "try again later"), true, false)),
             Err(e) => {
-                h.log(format!("{} {id} failed: {e:?}", job.kind));
-                h.notify("failed", json!({"id": id, "error": text_or(&e, "failed"), "retry": false}));
+                h.log(format!("{} {} failed: {e:?}", job.kind, job.id));
+                h.notify(&failed(text_or(&e, "failed"), false, false));
             }
         }
-        lock(&self.jobs).remove(id);
+        lock(&self.jobs).remove(&job.id);
     }
 }
 
@@ -865,6 +1016,18 @@ pub(crate) fn id_text(id: &Value) -> String {
 
 pub(crate) fn to_json(value: impl Serialize) -> Value {
     serde_json::to_value(value).unwrap_or_else(|e| Value::String(format!("<not JSON: {e}>")))
+}
+
+/// A message from protobuf's standard JSON, the way an open list is read: a field this SDK doesn't know is skipped, and
+/// so is an enum value it doesn't know (it reads as the default), never refused.
+pub fn from_json<T: DeserializeOwned>(value: Value) -> serde_json::Result<T> {
+    let opts = buffa::json::JsonParseOptions::new().ignore_unknown_enum_values(true);
+    buffa::json::with_json_parse_options(&opts, || serde_json::from_value(value))
+}
+
+/// A method's params as its message.
+pub(crate) fn from_params<T: DeserializeOwned>(params: Value, method: &str) -> anyhow::Result<T> {
+    from_json(params).with_context(|| format!("the params of {method} aren't its message"))
 }
 
 fn clip(text: &str, max: usize) -> &str {

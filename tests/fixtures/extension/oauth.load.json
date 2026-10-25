@@ -1,0 +1,15 @@
+{
+  "method": "oauth.load",
+  "params": {
+    "person": {
+      "handle": "james"
+    }
+  },
+  "result": {
+    "data": {
+      "expires_at": 1792800000.0,
+      "access_token": "x"
+    },
+    "refresh": true
+  }
+}

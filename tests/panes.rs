@@ -1,5 +1,5 @@
 //! The panes example against the stand-in node (Pointman's docs/dev/panes.md): an extension answers
-//! pane.open with its first content and keeps it current with set and patch, takes inputs in order
+//! pane.open with its first content and keeps it current with set and edit, takes inputs in order
 //! and refuses some, and hears context and close. The twin of core's tests/test_extension_panes.py.
 
 mod common;
@@ -7,7 +7,8 @@ mod common;
 use std::time::Duration;
 
 use common::{example, source};
-use pointman_extension::testing::{PaneOptions, StandIn};
+use pointman_extension::testing::{PaneOptions, PaneView, StandIn};
+use pointman_extension::v1::{PaneContext, PaneFormat, ThreadId};
 use pointman_extension::Extension;
 use serde_json::{json, Value};
 
@@ -18,39 +19,47 @@ fn panes() -> StandIn {
 }
 
 fn tap(block: &str) -> Value {
-    json!({"kind": "tap", "block": block, "value": null})
+    json!({"kind": "tap", "block": block})
+}
+
+fn json_of(block: Option<pointman_extension::v1::Block>) -> Value {
+    serde_json::to_value(block.unwrap()).unwrap()
+}
+
+/// A stat's number, from its first cell.
+fn count(block: Option<pointman_extension::v1::Block>) -> Value {
+    json_of(block)["chart"]["data"]["rows"][0][0].clone()
 }
 
 #[test]
-fn a_pane_opens_with_its_manifest_format_and_inputs_patch_it() {
+fn a_pane_opens_with_its_manifest_format_and_inputs_edit_it() {
     let node = panes();
-    let options = PaneOptions { context: json!({"thread": "thr_1"}), ..Default::default() };
+    let thread = ThreadId { value: "thr_1".into(), ..Default::default() };
+    let options =
+        PaneOptions { context: PaneContext { thread: thread.into(), ..Default::default() }, ..Default::default() };
     let view = node.open_pane_with("counter", json!({"start": 1}), options).unwrap();
-    assert_eq!(view.format().as_deref(), Some("blocks"));
-    let ids: Vec<Value> = view.content().as_array().unwrap().iter().map(|b| b["id"].clone()).collect();
-    assert_eq!(ids, [json!("top"), json!("plus")]);
-    assert_eq!(view.block("count").unwrap()["value"], 1); // inside a stack: found by id
-                                                          // the title it set while opening came after the answer, not before
+    assert_eq!(view.format(), Some(PaneFormat::PANE_FORMAT_BLOCKS));
+    let names: Vec<String> = view.blocks().iter().map(|b| b.name.clone().unwrap()).collect();
+    assert_eq!(names, ["top", "plus"]);
+    assert_eq!(count(view.block("count")), 1.0); // inside a stack: found by name
+                                                 // the title it set while opening came after the answer, not before
     view.wait(WAIT, |v| v.title().as_deref() == Some("Counter from 1")).unwrap();
-    assert_eq!(view.frames()[0], ("pane.title".to_string(), json!({"pane": view.id(), "title": "Counter from 1"})));
+    assert_eq!(
+        view.frames()[0],
+        ("pane.title".to_string(), json!({"pane": {"value": view.id()}, "title": "Counter from 1"}))
+    );
 
     for _ in 0..3 {
-        view.input(tap("plus")).unwrap(); // its patch is applied by the answer
+        view.input_json(tap("plus")).unwrap(); // its edits are applied by the answer
     }
-    assert_eq!(
-        view.block("count").unwrap(),
-        json!({"type": "stat", "id": "count", "label": "Taps", "value": 4, "tone": "good"})
-    );
+    assert_eq!(count(view.block("count")), 4.0);
+    assert_eq!(json_of(view.block("count"))["chart"]["tone"], "TONE_GOOD");
+    // show sent the stat alone, by its name: not the stack it is in, nor the button
     let last = view.frames().pop().unwrap();
-    assert_eq!(
-        last,
-        (
-            "pane.patch".to_string(),
-            json!({"pane": view.id(), "patch": [
-            {"op": "add", "path": "/b/count/tone", "value": "good"},
-            {"op": "add", "path": "/b/count/value", "value": 4}]})
-        )
-    );
+    assert_eq!(last.0, "pane.edit");
+    let edits = last.1["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0]["replace"]["block"]["name"], "count");
     assert!(view.problems().is_empty(), "{:?}", view.problems());
 }
 
@@ -59,22 +68,22 @@ fn a_refused_input_says_why_and_changes_nothing() {
     let node = panes();
     let view = node.open_pane("counter", Value::Null).unwrap();
     let before = view.content();
-    assert_eq!(view.input(tap("minus")).unwrap_err().message, "only + works here");
+    assert_eq!(view.input_json(tap("minus")).unwrap_err().message, "only + works here");
     assert_eq!(view.content(), before);
 
     let board = node.open_pane("board", Value::Null).unwrap();
-    board.input(json!({"kind": "move", "item": "lin_1", "to": "Done"})).unwrap();
+    board.input_json(json!({"kind": "move", "item": "lin_1", "to": "Done"})).unwrap();
     assert_eq!(board.item("lin_1").unwrap()["state"], "Done");
     assert_eq!(board.item("lin_1").unwrap()["category"], "done");
-    let refused = board.input(json!({"kind": "move", "item": "lin_parent", "to": "Done"})).unwrap_err();
+    let refused = board.input_json(json!({"kind": "move", "item": "lin_parent", "to": "Done"})).unwrap_err();
     assert_eq!(refused.message, "Linear decides when parents close");
     assert_eq!(board.item("lin_parent").unwrap()["state"], "In Progress");
-    let refused = board.input(json!({"kind": "rank", "item": "lin_1", "before": "lin_parent"})).unwrap_err();
+    let refused = board.input_json(json!({"kind": "rank", "item": "lin_1", "before": "lin_parent"})).unwrap_err();
     assert_eq!(refused.message, "rank isn't something this board does");
 
     // a pane that never said what it takes refuses everything
     let clock = node.open_pane("clock", Value::Null).unwrap();
-    assert_eq!(clock.input(tap("ticks")).unwrap_err().message, "this pane takes no input");
+    assert_eq!(clock.input_json(tap("ticks")).unwrap_err().message, "this pane takes no input");
     assert!(view.problems().is_empty() && board.problems().is_empty());
 }
 
@@ -82,13 +91,15 @@ fn a_refused_input_says_why_and_changes_nothing() {
 fn context_and_close_reach_the_pane() {
     let node = panes();
     let view = node.open_pane("counter", Value::Null).unwrap();
-    view.look_at(json!({"thread": "thr_9"})).unwrap();
-    view.wait(WAIT, |v| v.block("seen").is_some_and(|b| b["markdown"] == "Looking at thr_9")).unwrap();
-    view.input(tap("plus")).unwrap();
+    let thread = ThreadId { value: "thr_9".into(), ..Default::default() };
+    view.look_at(PaneContext { thread: thread.into(), ..Default::default() }).unwrap();
+    view.wait(WAIT, |v| v.block("seen").is_some_and(|b| json_of(Some(b))["text"]["markdown"] == "Looking at thr_9"))
+        .unwrap();
+    view.input_json(tap("plus")).unwrap();
     view.close("idle").unwrap();
     let closed = node.wait_event("panes.closed", WAIT).unwrap();
     assert_eq!(closed, json!({"pane": view.id(), "reason": "idle", "n": 1}));
-    let refused = view.input(tap("plus")).unwrap_err();
+    let refused = view.input_json(tap("plus")).unwrap_err();
     assert_eq!(refused.message, format!("no pane {} is open", view.id()));
 }
 
@@ -96,18 +107,19 @@ fn context_and_close_reach_the_pane() {
 fn the_extension_closes_a_pane_itself() {
     let node = panes();
     let view = node.open_pane("counter", Value::Null).unwrap();
-    view.input(tap("stop")).unwrap();
+    view.input_json(tap("stop")).unwrap();
     view.wait(WAIT, |v| v.closed().as_deref() == Some("stopped")).unwrap();
-    assert!(view.frames().contains(&("pane.closed".to_string(), json!({"pane": view.id(), "reason": "stopped"}))));
+    let closed = ("pane.closed".to_string(), json!({"pane": {"value": view.id()}, "reason": "stopped"}));
+    assert!(view.frames().contains(&closed), "{:?}", view.frames());
     assert_eq!(node.wait_event("panes.closed", WAIT).unwrap()["reason"], "stopped");
-    assert!(view.input(tap("plus")).unwrap_err().message.starts_with("no pane"));
+    assert!(view.input_json(tap("plus")).unwrap_err().message.starts_with("no pane"));
 }
 
 #[test]
 fn a_task_keeps_every_open_pane_current() {
     let node = panes();
     let (a, b) = (node.open_pane("clock", Value::Null).unwrap(), node.open_pane("clock", Value::Null).unwrap());
-    let ticks = |v: &pointman_extension::testing::PaneView| v.block("ticks").and_then(|b| b["value"].as_u64());
+    let ticks = |v: &PaneView| count(v.block("ticks")).as_f64().map(|n| n as u64);
     a.wait(WAIT, |v| ticks(v) >= Some(3)).unwrap();
     b.wait(WAIT, |v| ticks(v) >= Some(3)).unwrap();
     a.close("closed").unwrap();
@@ -118,33 +130,33 @@ fn a_task_keeps_every_open_pane_current() {
     assert!(a.title().is_none() && a.problems().is_empty() && b.problems().is_empty());
     // show sent only what changed: each tick the count, and the log's new row
     let frames = b.frames();
-    assert!(frames.iter().all(|(method, _)| method == "pane.patch"), "{frames:?}");
-    assert_eq!(
-        frames[1].1["patch"],
-        json!([{"op": "add", "path": "/b/ticks/value", "value": 2},
-               {"op": "add", "path": "/b/log/items/-", "value": {"id": "t2", "title": "Tick 2"}}])
-    );
+    assert!(frames.iter().all(|(method, _)| method == "pane.edit"), "{frames:?}");
+    let edits = frames[1].1["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 2, "{edits:?}");
+    assert_eq!(edits[0]["replace"]["block"]["name"], "ticks");
+    assert_eq!(edits[1]["putItems"]["block"], "log");
+    assert_eq!(edits[1]["putItems"]["items"], json!([{"list": {"id": "t2", "title": "Tick 2"}}]));
     let shown = ticks(&b).unwrap() as usize;
-    assert!(b.block("log").unwrap()["items"].as_array().unwrap().len() >= shown.min(8));
+    let log = json_of(b.block("log"));
+    assert!(log["list"]["items"].as_array().unwrap().len() >= shown.min(8));
 }
 
 #[test]
 fn show_board_sends_only_the_items_that_changed() {
     let node = panes();
     let board = node.open_pane("board", Value::Null).unwrap();
-    board.input(json!({"kind": "move", "item": "lin_1", "to": "Done"})).unwrap();
-    board.input(json!({"kind": "edit", "item": "lin_parent", "fields": {"title": "Parent, renamed"}})).unwrap();
+    board.input_json(json!({"kind": "move", "item": "lin_1", "to": "Done"})).unwrap();
+    board.input_json(json!({"kind": "edit", "item": "lin_parent", "fields": {"title": "Parent, renamed"}})).unwrap();
     let frames = board.frames();
     assert_eq!(frames.len(), 2);
-    // the move's patch was kept, so the edit's show sends the title alone
-    assert_eq!(
-        frames[1],
-        (
-            "pane.patch".to_string(),
-            json!({"pane": board.id(), "patch": [
-            {"op": "add", "path": "/i/lin_parent/title", "value": "Parent, renamed"}]})
-        )
-    );
+    // the move sent its item; the edit's show sends the renamed one alone
+    assert_eq!(frames[0].0, "pane.edit");
+    let item = &frames[1].1["edits"][0]["putItems"]["items"];
+    assert_eq!(frames[1].1["edits"].as_array().unwrap().len(), 1);
+    assert_eq!(item.as_array().unwrap().len(), 1);
+    assert_eq!(item[0]["board"]["id"], "lin_parent");
+    assert_eq!(item[0]["board"]["title"], "Parent, renamed");
+    assert!(frames[1].1["edits"][0]["putItems"].get("block").is_none(), "a board's items name no block");
     assert_eq!(board.item("lin_parent").unwrap()["title"], "Parent, renamed");
     assert_eq!(board.item("lin_1").unwrap()["state"], "Done");
     assert!(board.problems().is_empty(), "{:?}", board.problems());
@@ -155,24 +167,24 @@ fn panes_that_dont_open() {
     let node = panes();
     assert_eq!(node.open_pane("counter", json!({"fail": true})).err().unwrap().message, "no such counter");
     let bad = node.open_pane("counter", json!({"bad": true})).err().unwrap();
-    assert_eq!(bad.message, "a blocks pane opens with its blocks, an array");
+    assert_eq!(bad.message, "a blocks pane opens with its content, as blocks");
     assert_eq!(node.open_pane("nope", Value::Null).err().unwrap().message, "nope isn't a pane of panes");
     let page = node.open_pane("page", Value::Null).unwrap();
     assert_eq!(
         (page.format(), page.path(), page.title()),
-        (Some("page".into()), Some("pages/index.html".into()), Some("A page".into()))
+        (Some(PaneFormat::PANE_FORMAT_PAGE), Some("pages/index.html".into()), Some("A page".into()))
     );
     // the extension carries on
-    assert_eq!(node.open_pane("counter", Value::Null).unwrap().block("count").unwrap()["value"], 0);
+    assert_eq!(count(node.open_pane("counter", Value::Null).unwrap().block("count")), 0.0);
 }
 
 #[test]
 fn the_stand_in_says_what_the_node_would_refuse() {
     let node = panes();
     let view = node.open_pane("counter", Value::Null).unwrap();
-    view.input(tap("broken")).unwrap();
-    assert_eq!(view.problems(), ["patch: '/b/missing/value': no block 'missing'"]);
-    assert_eq!(view.block("count").unwrap()["value"], 0);
+    view.input_json(tap("broken")).unwrap();
+    assert_eq!(view.problems(), ["edits: edit 1: no block \"missing\""]);
+    assert_eq!(count(view.block("count")), 0.0); // all or none: nothing applied
 }
 
 #[test]
@@ -184,7 +196,7 @@ fn a_pane_must_be_in_the_manifest() {
     assert_eq!(formats["page"].as_deref(), Some("page"));
     let mut ext = ext;
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ext.pane("other", |_pane: &pointman_extension::Pane| Ok(json!({})));
+        ext.pane("other", |_pane: &pointman_extension::Pane| Ok(Default::default()));
     }));
     assert!(panicked.is_err());
 }

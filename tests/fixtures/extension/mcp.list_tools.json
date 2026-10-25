@@ -1,0 +1,20 @@
+{
+  "method": "mcp.list_tools",
+  "params": {
+    "person": {
+      "handle": "james"
+    },
+    "fresh": true
+  },
+  "result": {
+    "signedIn": true,
+    "tools": [
+      {
+        "name": "list_issues",
+        "inputSchema": {
+          "type": "object"
+        }
+      }
+    ]
+  }
+}

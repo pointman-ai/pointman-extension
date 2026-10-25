@@ -1,0 +1,9 @@
+{
+  "method": "pane.title",
+  "params": {
+    "pane": {
+      "value": "pane_12"
+    },
+    "title": "PR 42 · Fix the keeper"
+  }
+}

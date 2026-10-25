@@ -1,0 +1,11 @@
+{
+  "method": "oauth.people",
+  "params": {},
+  "result": {
+    "people": [
+      {
+        "handle": "james"
+      }
+    ]
+  }
+}

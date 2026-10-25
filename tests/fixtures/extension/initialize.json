@@ -1,0 +1,24 @@
+{
+  "method": "initialize",
+  "params": {
+    "protocol": "PROTOCOL_TYPED",
+    "node": "mac-m4",
+    "machine": {
+      "value": "mac-m4"
+    },
+    "settings": {
+      "hours": 24.0
+    },
+    "workDir": "/w/trace",
+    "stateDir": "/s/trace",
+    "configDir": "/c/trace",
+    "roots": [
+      "/Users/me/Documents"
+    ]
+  },
+  "result": {
+    "protocol": "PROTOCOL_TYPED",
+    "id": "trace",
+    "version": "0.3.0"
+  }
+}
