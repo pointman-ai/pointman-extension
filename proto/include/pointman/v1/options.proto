@@ -1,0 +1,82 @@
+// Pointman's own options (TYPES, docs/dev/types.md). DRAFT for review: not wired to any generator yet.
+syntax = "proto3";
+
+package pointman.v1;
+
+import "google/protobuf/descriptor.proto";
+
+// Rich text kinds: each has its own limits and parse.
+enum TextKind {
+  TEXT_KIND_UNSPECIFIED = 0;
+  TEXT_KIND_MARKDOWN = 1;  // our Markdown with references, at most 40,000 characters
+  TEXT_KIND_TITLE = 2;  // one line, at most 200 characters
+}
+
+// Where a block may appear.
+enum BlockPlace {
+  BLOCK_PLACE_UNSPECIFIED = 0;  // posts and panels
+  BLOCK_PLACE_PANEL_ONLY = 1;               // takes input, or is a pane's own view
+}
+
+// Who may call a method (James, 5918 [19381]): MCP offers agents only the tools they may use, and the CLI shows
+// only the commands its caller may run. Unset: people and agents; set only where a method differs.
+// Everything else about a method's doors comes from its schema by convention (James, [19442]): the web route from
+// its resource's address and its kind (Create, Get, List, Update, Delete, or a custom verb), the MCP tool and the
+// CLI command from its name, their inputs, flags and help from its request's fields and comments.
+enum Caller {
+  CALLER_UNSPECIFIED = 0;
+  CALLER_PERSON = 1;  // a person, signed in on a device
+  CALLER_AGENT = 2;   // an agent, through its node
+  CALLER_NODE = 3;    // a machine's node itself
+  CALLER_ANYONE = 4;  // no token at all: a new device signing in (pairing, a grant), through /v1's own calls, whose wrong codes count against the address
+}
+
+// How a field goes in today's JSON where its type doesn't say (TYPES-6: a job's params and result, until the switch,
+// TYPES-12, which removes this). Without it: an id is its text (term_5), a Timestamp RFC 3339, a Duration seconds,
+// an enum its word in lower case (KIND_SHELL is shell).
+enum V1Form {
+  V1_FORM_UNSPECIFIED = 0;
+  V1_FORM_NUMBER = 1;        // an id as core's number: 12, not thr_12
+  V1_FORM_UNIX_SECONDS = 2;  // a Timestamp as unix seconds: 1792750260, or 1792750260.5
+  V1_FORM_MILLISECONDS = 3;  // a Duration as whole milliseconds
+}
+
+// What a setting's field doesn't say by its type and limits (settings.proto, TYPES-21).
+message SettingOptions {
+  // Its value until you set one, written as `pointman config update --values` takes it: a word, a number, true or
+  // false, or a list joined by commas ("" for none).
+  string default = 1;
+  // What a string, or each string of a list, holds when it's more than words.
+  SettingKind kind = 2;
+}
+
+// What a setting's strings hold (settings.proto). Unset: as its type says.
+enum SettingKind {
+  SETTING_KIND_UNSPECIFIED = 0;
+  SETTING_KIND_HANDLES = 1;   // agents' handles, kept lowercase and sorted
+  SETTING_KIND_THEME = 2;     // auto, or a theme's id: a built-in one or one of yours
+  SETTING_KIND_SECTIONS = 3;  // Today's sections in their order: core's, or an extension's as ext:<extension>/<id>
+}
+
+extend google.protobuf.FieldOptions {
+  TextKind text = 51002;
+  V1Form v1_form = 51006;
+  // Only these callers may set it (EXT-83, shipwright 6914 [21137]): the doors leave it out of tools and commands
+  // for the rest, and core refuses it from them. Unset: whoever may call the method.
+  repeated Caller set_by = 51007;
+  // A field of settings.proto's: an app setting (TYPES-21).
+  SettingOptions setting = 51008;
+}
+
+extend google.protobuf.MessageOptions {
+  BlockPlace place = 51003;
+  bool strict = 51004;      // refuse unknown fields on the way in (approvals, agent changes, charts, manifests)
+  string id_prefix = 51005; // an id type's wire form: "task" makes task_412
+}
+
+extend google.protobuf.MethodOptions {
+  repeated Caller callers = 51010;
+  // Its MCP tool comes with an agent's session, not behind its client's tool search: what a woken run answers with
+  // first (MB-203: finding a tool first is a whole model turn). Set on few: each costs every session its schema.
+  bool always_load = 51011;
+}

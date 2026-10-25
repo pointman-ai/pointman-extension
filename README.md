@@ -72,6 +72,72 @@ its own. Settings get the defaults from the manifest's `[settings]` schema (a ch
 extension carries on. Numbers in free-form data come back as integers when they are whole (protobuf's `Value` has one
 kind of number).
 
+## Your own proto (recommended, not required)
+
+An extension can keep its commands' params, results and settings in a proto of its own, the way Pointman keeps its
+own: `proto/<id>/v1/<id>.proto`, `package <id>.v1;`. Command `<id>.<verb>` takes `<Verb>Params` and answers
+`<Verb>Result` (`youtube.upload`: `UploadParams`, `UploadResult`), and the settings are `message Settings`. The node
+and core still read extension.toml; the proto is where its schemas come from, so nothing of theirs changes.
+
+```proto
+syntax = "proto3";
+package hello.v1;
+
+import "buf/validate/validate.proto";
+import "pointman/v1/options.proto";
+
+message GreetParams {
+  // Who to greet.
+  string name = 1 [(buf.validate.field).required = true, (buf.validate.field).string.max_len = 100];
+}
+
+message GreetResult {
+  string text = 1;
+}
+
+message Settings {
+  // What to say before the name.
+  string greeting = 1 [(pointman.v1.setting).default = "Hello"];
+}
+```
+
+- **The manifest:** `pointman-extension manifest write` puts each command's `params` and the `[settings]` schema in
+  extension.toml from those messages, and keeps the rest of the file (a command's title, lane, outputs, cancellable
+  stay yours). `pointman-extension manifest check` fails while the file says something else: for CI, or call
+  `pointman_extension::proto::check(dir)` from a test. Install it with
+  `cargo install --git https://github.com/pointman-ai/pointman-extension --features proto pointman-extension`.
+- **What a schema says:** a field's comment is its `description`. buf.validate's rules become the JSON Schema keywords
+  they match: a string's `min_len`, `max_len`, `len`, `pattern`, `in`, `not_in`, `const` and `email`/`uri`/`uuid`/
+  `hostname`/`ipv4`/`ipv6`; a number's `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `const`; a list's `min_items`,
+  `max_items`, `unique`, `items`; a map's `min_pairs`, `max_pairs`, `keys`, `values`; an enum's `in`, `not_in`,
+  `const`; `required`, and a oneof's `required`. An enum is a string, its values' names in lower case without the
+  enum's prefix (`PRIVACY_PUBLIC` is `public`, its `…_UNSPECIFIED` left out). A default is Pointman's own settings'
+  option, `(pointman.v1.setting).default`, written as `pointman config` takes it (a word, a number, true or false, a
+  list joined by commas). A rule with no keyword is refused rather than left out, so the manifest never says less
+  than the proto. `buf/validate/validate.proto` and `pointman/v1/options.proto` come with the SDK (proto/include).
+- **The types:** with the SDK as a build dependency (`features = ["proto"]`), `pointman_extension::proto::build()` in
+  build.rs makes buffa's types for the proto, and `mod proto { pointman_extension::include_proto!(); }` brings them in. Then a
+  handler takes its params' message and answers its result's, and the settings read as `Settings`:
+
+```rust
+mod proto {
+    pointman_extension::include_proto!();
+}
+use proto::hello::v1::{GreetParams, GreetResult, Settings};
+
+ext.typed_command(move |job: &Job, p: GreetParams| {
+    let settings: Settings = h.typed_settings()?;
+    Ok(GreetResult { text: format!("{}, {}!", settings.greeting, p.name), ..Default::default() })
+});
+```
+
+  The JSON is the manifest's both ways: each field by its own name (`made_for_kids`), each enum by its word, each
+  64-bit integer as a number. A field the params schema requires fails the command when it's missing (`name is
+  missing`), and so does a word an enum doesn't have, before the handler runs; a default in the schema is filled in.
+  The extension needs `buffa` (with `json`) and `serde` as its own dependencies, at the SDK's versions, for buffa's
+  code (and `buffa-types` if its proto uses google.protobuf's types). Pointman's template
+  ([pointman-extension-template](https://github.com/pointman-ai/pointman-extension-template)) is set up this way.
+
 ## Panes
 
 A pane shows something an extension keeps on the node (Pointman's docs/dev/panes.md): blocks, a
@@ -166,7 +232,8 @@ hints (`hint`, `audio_hint`) and a person's control (`control`, `control_input`)
 A failure is a `testing::Failed { message, retry, cancelled }`, whose Display is the extension's own
 message.
 
-This crate's own tests: `cargo test`. They run `examples/hello` (the Rust twin of the Python
+This crate's own tests: `cargo test --features proto` (`tests/manifest.rs` needs the feature: every rule of
+tests/fixtures/proto/kitchen's proto and the schema it makes, and `write` and `check` on a copy of it). They run `examples/hello` (the Rust twin of the Python
 template's `hello.greet`), `examples/demo` (every part of the API), `examples/panes` and `examples/video` under
 `StandIn`, drive the demo line by line to check the wire format, read every protocol fixture (tests/fixtures/extension)
 back and forth, and apply the shared edit cases (tests/fixtures/panes/edits.json). `tests/python.rs` also runs core's

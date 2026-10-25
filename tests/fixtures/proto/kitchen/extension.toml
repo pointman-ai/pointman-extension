@@ -1,0 +1,40 @@
+# A test extension whose proto says every rule the generator knows (tests/manifest.rs).
+[extension]
+id = "kitchen"
+name = "Kitchen"
+version = "0.1.0"
+publisher = "pointman-ai"
+summary = "Every rule of an extension's own proto, for the SDK's tests."
+node = ">=0.3,<1"
+platforms = ["macos-arm64"]
+
+[run]
+command = ["bin/kitchen"]
+runtime = "binary"
+
+[[commands]]
+kind = "kitchen.upload"
+title = "Upload a video"   # stays as written
+lane = "main"
+cancellable = true
+outputs = ["video"]
+params = {type = "object"}
+
+[[commands]]
+kind = "kitchen.status"
+title = "Status"
+params = {type = "object", properties = {verbose = {type = "boolean"}}}   # no StatusParams: kept
+
+[[commands]]
+kind = "kitchen.set_thumbnail"
+title = "Set a thumbnail"
+params = {type = "object"}
+
+[[commands]]
+kind = "kitchen.ping"
+title = "Ping"
+params = {type = "object"}
+
+[[events]]
+name = "kitchen.uploaded"
+description = "A video went up."
