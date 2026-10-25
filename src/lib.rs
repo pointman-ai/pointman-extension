@@ -1161,6 +1161,14 @@ kind = "unit.b"
     }
 
     #[test]
+    fn a_message_from_a_newer_node_reads_with_what_it_doesnt_know_left_out() {
+        // an enum value and a field this SDK is too old for (docs/dev/types.md rule 4, TYPES-22): the rest is kept
+        let r: OutputRequest =
+            from_json(json!({"path": "a.png", "kind": "image", "role": "ROLE_FROM_LATER", "added_later": 1})).unwrap();
+        assert_eq!((r.path.as_str(), r.kind.as_str(), r.role.to_i32()), ("a.png", "image", 0));
+    }
+
+    #[test]
     fn settings_get_the_schemas_defaults() {
         let root = temp("defaults");
         std::fs::write(root.join("extension.toml"), MANIFEST).unwrap();
