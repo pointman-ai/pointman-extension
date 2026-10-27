@@ -1,8 +1,8 @@
 {
   "method": "progress",
   "params": {
-    "id": {
-      "value": "req-412"
+    "command": {
+      "id": "req-412"
     },
     "fraction": 0.5,
     "stage": "rendering",

@@ -55,7 +55,7 @@ use crate::protocol::{
     PaneEditRequest, PaneFrameRequest, PaneInputRequest, PaneInputResponse, PaneOpenRequest, PaneOpenResponse,
     PaneSetRequest, PaneTitleRequest, PaneViewer, PaneViewersRequest,
 };
-use crate::v1::{Block, PaneContent, PaneContext, PaneEdit, PaneFormat, PaneId, PaneInput};
+use crate::v1::{Block, PaneContent, PaneContext, PaneEdit, PaneFormat, PaneInput, PaneRef};
 use crate::{
     caused_by, convert, edits, from_params, guarded, lock, read, spawn, text_or, to_json, write, Handle, Notification,
     Outcome,
@@ -206,8 +206,8 @@ impl Pane {
         &self.0.id
     }
 
-    fn pane_id(&self) -> buffa::MessageField<PaneId, buffa::Inline<PaneId>> {
-        PaneId { value: self.0.id.clone(), ..Default::default() }.into()
+    fn pane_ref(&self) -> buffa::MessageField<PaneRef, buffa::Inline<PaneRef>> {
+        PaneRef { id: self.0.id.clone(), ..Default::default() }.into()
     }
 
     /// Which of the manifest's `[[panes]]` it is.
@@ -258,7 +258,7 @@ impl Pane {
 
     fn set_content(&self, content: PaneContent) {
         let mut last = lock(&self.0.last);
-        self.notify(&PaneSetRequest { pane: self.pane_id(), content: content.clone().into(), ..Default::default() });
+        self.notify(&PaneSetRequest { pane: self.pane_ref(), content: content.clone().into(), ..Default::default() });
         *last = Last::Known(content);
     }
 
@@ -294,10 +294,12 @@ impl Pane {
     fn send_diff(&self, last: &mut Last, new: PaneContent, edits: Option<Vec<PaneEdit>>) {
         match edits {
             Some(edits) if edits.is_empty() => {} // only what's the person's changed (the open tab)
-            Some(edits) => self.notify(&PaneEditRequest { pane: self.pane_id(), edits, ..Default::default() }),
-            None => {
-                self.notify(&PaneSetRequest { pane: self.pane_id(), content: new.clone().into(), ..Default::default() })
-            }
+            Some(edits) => self.notify(&PaneEditRequest { pane: self.pane_ref(), edits, ..Default::default() }),
+            None => self.notify(&PaneSetRequest {
+                pane: self.pane_ref(),
+                content: new.clone().into(),
+                ..Default::default()
+            }),
         }
         *last = Last::Known(new);
     }
@@ -309,7 +311,7 @@ impl Pane {
             return;
         }
         let mut last = lock(&self.0.last);
-        self.notify(&PaneEditRequest { pane: self.pane_id(), edits: edits.clone(), ..Default::default() });
+        self.notify(&PaneEditRequest { pane: self.pane_ref(), edits: edits.clone(), ..Default::default() });
         *last = match std::mem::replace(&mut *last, Last::Unknown) {
             Last::Known(content) => edits::apply(&content, &edits).map_or(Last::Unknown, Last::Known),
             _ => Last::Unknown,
@@ -327,14 +329,14 @@ impl Pane {
     }
 
     pub fn set_title(&self, title: &str) {
-        self.notify(&PaneTitleRequest { pane: self.pane_id(), title: title.to_string(), ..Default::default() });
+        self.notify(&PaneTitleRequest { pane: self.pane_ref(), title: title.to_string(), ..Default::default() });
     }
 
     /// Close it from the extension's side: what it showed is gone, say.
     pub fn close(&self, reason: &str) {
         if self.drop_it(reason) {
             self.0.handle.notify(&PaneClosedRequest {
-                pane: self.pane_id(),
+                pane: self.pane_ref(),
                 reason: reason.to_string(),
                 ..Default::default()
             });
@@ -410,7 +412,7 @@ impl Pane {
             return false;
         }
         let frame = PaneFrameRequest {
-            pane: self.pane_id(),
+            pane: self.pane_ref(),
             captured_ms: captured_ms as i64,
             width: i32::from(width),
             height: i32::from(height),
@@ -433,7 +435,7 @@ impl Pane {
             return false;
         }
         let sound = PaneAudioRequest {
-            pane: self.pane_id(),
+            pane: self.pane_ref(),
             captured_ms: captured_ms as i64,
             sound: Some(Sound::Aac(aac.to_vec())),
             ..Default::default()
@@ -517,7 +519,7 @@ pub(crate) fn message(
             Ok(request) => request,
             Err(e) => return error(h, rid, format!("{e:#}")),
         };
-        let pid = request.pane.as_option().map(|p| p.value.clone()).unwrap_or_default();
+        let pid = request.pane.as_option().map(|p| p.id.clone()).unwrap_or_default();
         let open = request.open.clone();
         let mut panes = lock(&h.0.panes);
         let why = match &opener {
@@ -568,7 +570,7 @@ pub(crate) fn message(
         }
         _ => from_params::<PaneCloseRequest>(params.clone(), method).ok().and_then(|r| r.pane.into_option()),
     }
-    .map(|p| p.value)
+    .map(|p| p.id)
     .unwrap_or_default();
     let pane = lock(&h.0.panes).get(&pid).cloned();
     let Some(pane) = pane else {

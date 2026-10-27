@@ -3,7 +3,7 @@
   "params": {
     "people": [
       {
-        "handle": "james"
+        "name": "james"
       }
     ]
   },
@@ -18,7 +18,7 @@
         ],
         "why": "signed out",
         "person": {
-          "handle": "james"
+          "name": "james"
         }
       }
     ]

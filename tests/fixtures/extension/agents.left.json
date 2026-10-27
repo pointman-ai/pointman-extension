@@ -2,7 +2,7 @@
   "method": "agents.left",
   "params": {
     "live": {
-      "value": "run_6296"
+      "id": "run_6296"
     },
     "seq": "10",
     "reason": "REASON_LEFT"

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pointman_extension::protocol::pane_open_response::{video, Video};
 use pointman_extension::protocol::{PaneControlRequest, PaneOpenResponse};
-use pointman_extension::v1::{member_ref, PaneInput};
+use pointman_extension::v1::PaneInput;
 use pointman_extension::{Extension, Pane, Refused, VIDEO_FRAME_MAX};
 use serde_json::{json, Value};
 
@@ -63,11 +63,9 @@ fn main() -> anyhow::Result<()> {
                 return Err(Refused::new("this test card can't be controlled").into());
             }
             let grant = grant.map(|g| {
-                let by = match g.by.as_option().and_then(|m| m.kind.as_ref()) {
-                    Some(member_ref::Kind::Handle(handle)) => handle.clone(),
-                    _ => String::new(),
-                };
-                json!({"until": g.until.seconds, "by": by, "device": g.device})
+                let by = g.by.as_option().map(|m| m.name.clone()).unwrap_or_default();
+                let device = g.device.as_option().map(|d| d.name.clone()).unwrap_or_default();
+                json!({"until": g.until.seconds, "by": by, "device": device})
             });
             *held.lock().unwrap() = grant.clone();
             pane.handle().event("video.control", json!({"grant": grant}));

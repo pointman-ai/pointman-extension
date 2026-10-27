@@ -1,2 +1,2 @@
-core: pointman-ai/pointman f6af1fbe
+core: pointman-ai/pointman 96b356147
 from: src/pointman/descriptors.pb, closure of pointman/extension/v1/protocol.proto

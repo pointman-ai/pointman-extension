@@ -4,7 +4,7 @@
     "part": "james",
     "action": "ACTION_AUTH",
     "person": {
-      "handle": "james"
+      "name": "james"
     }
   },
   "result": {

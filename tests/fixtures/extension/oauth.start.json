@@ -2,7 +2,7 @@
   "method": "oauth.start",
   "params": {
     "person": {
-      "handle": "james"
+      "name": "james"
     },
     "redirectUri": "https://api.pointman.ai/v1/oauth/callback"
   },

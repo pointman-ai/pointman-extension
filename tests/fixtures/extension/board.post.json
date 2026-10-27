@@ -2,7 +2,7 @@
   "method": "board.post",
   "params": {
     "thread": {
-      "value": "thr_13661"
+      "id": "thr_13661"
     },
     "text": "Render done: cut 3.",
     "blocks": [
@@ -26,7 +26,7 @@
     ],
     "tasks": [
       {
-        "ref": "PFE-12"
+        "name": "PFE-12"
       }
     ],
     "links": [
@@ -35,7 +35,7 @@
   },
   "result": {
     "post": {
-      "value": "post_19455"
+      "id": "post_19455"
     }
   }
 }

@@ -1,8 +1,8 @@
 {
   "method": "checkpoint",
   "params": {
-    "id": {
-      "value": "req-412"
+    "command": {
+      "id": "req-412"
     },
     "state": {
       "frame": 125.0

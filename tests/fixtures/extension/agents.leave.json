@@ -2,7 +2,7 @@
   "method": "agents.leave",
   "params": {
     "live": {
-      "value": "run_6296"
+      "id": "run_6296"
     }
   },
   "result": {}

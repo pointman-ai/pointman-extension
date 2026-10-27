@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import messageboard
+from google.protobuf import json_format, message
 from messageboard.extensions.host import ExtensionError, ExtensionHost
 from messageboard.extensions.manifest import load
 
@@ -42,6 +43,15 @@ def wait_for(cond, timeout=10.0):
             return True
         time.sleep(0.05)
     return False
+
+
+def tool(node, name, arguments):
+    """One of the node's own requests: mcp.call_tool, the demo's `ask` or `relay` by name, its result as a dict
+    (core's host answers with the protobuf message, the SDK's stand-in with its own)."""
+    answer = node.call("mcp.call_tool", {"person": {"name": "james"}, "name": name, "arguments": arguments})
+    if isinstance(answer, message.Message):
+        return json_format.MessageToDict(answer).get("result", {})
+    return answer.result
 
 
 def host(root, name, **kw):
@@ -78,11 +88,11 @@ def host_hello():
 
 def host_demo():
     h = host(DEMO, "demo", settings={"limit": 5}, secrets=VAULT.__getitem__, secret_names=lambda prefix: list(VAULT),
-             methods={"demo.lookup": lambda p: {"found": p}})
+             methods={"files.get": lambda get: {"file": {"path": get.path, "version": 3}}})
     try:
         assert wait_for(lambda: "demo.started" in h.events and "demo.tick" in h.events), h.events
         assert h.events["demo.started"]["settings"] == {"label": "demo", "limit": 5}
-        assert h.events["demo.started"]["node"]["machine"] == "test-machine"
+        assert h.events["demo.started"]["node"]["machine"] == {"name": "test-machine"}
         assert h.run("demo.secret", {"name": "demo.work", "prefix": "demo."}).result == \
             {"value": "w", "names": ["demo.spare", "demo.work"]}
         assert h.run("demo.secret", {"prefix": ""}).result == {"names": ["demo.spare", "demo.work", "shared.key"]}
@@ -95,8 +105,8 @@ def host_demo():
                ExtensionError, cancelled=True)
         done = h.run("demo.step", {"steps": 3})
         assert done.result["from"] == 0 and done.result["to"] == 3
-        assert h.call("demo.ask", {"q": 1})["params"] == {"q": 1}
-        assert h.call("demo.relay", {"method": "demo.lookup", "params": {"x": 1}}) == {"found": {"x": 1}}
+        assert tool(h, "ask", {"q": 1})["params"] == {"q": 1}
+        assert tool(h, "relay", {"method": "files.get", "path": "notes.md"}) == {"file": {"path": "notes.md", "version": 3}}
         # a crash fails what's running with retry, and the node starts it again
         raises(lambda: h.run("demo.fail", {"how": "exit"}), ExtensionError, retry=True)
         assert h.wait_ready(15), h.error
@@ -109,7 +119,7 @@ def standin_hello():
     with StandInNode(HELLO, settings={"greeting": "Hi"}, state_dir=STATE / "standin") as node:
         done = node.run("hello.greet", {"name": "James"})
         assert done.result == {"text": "Hi, James!"}
-        assert Path(done.outputs[0]["path"]).read_text() == "Hi, James!\n"
+        assert Path(done.outputs[0].path).read_text() == "Hi, James!\n"
         assert node.events["hello.last"] == {"name": "James"}
     with StandInNode(HELLO) as node:
         assert node.run("hello.greet", {"name": "Ada"}).result == {"text": "Hello, Ada!"}
@@ -124,10 +134,10 @@ def standin_demo():
         t = threading.Thread(target=lambda: result.update(e=raises(
             lambda: node.run("demo.step", {"steps": 200, "step_ms": 20}, cid="long"), ExtensionFailed)))
         t.start()
-        assert wait_for(lambda: node.cancel("long") == {"found": True}), "it never had the command"
+        assert wait_for(lambda: node.cancel("long").found), "it never had the command"
         t.join()
         assert result["e"].cancelled
-        assert node.call("demo.ask", {"q": 2})["params"] == {"q": 2}
+        assert tool(node, "ask", {"q": 2})["params"] == {"q": 2}
 
 
 print(f"core: {Path(messageboard.__file__).parent}", flush=True)

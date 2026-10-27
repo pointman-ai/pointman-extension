@@ -8,7 +8,7 @@
   "result": {
     "signedIn": true,
     "person": {
-      "handle": "james"
+      "name": "james"
     },
     "tools": 23
   }

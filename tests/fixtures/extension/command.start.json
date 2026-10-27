@@ -1,8 +1,8 @@
 {
   "method": "command.start",
   "params": {
-    "id": {
-      "value": "req-412"
+    "command": {
+      "id": "req-412"
     },
     "kind": "resolve.render",
     "params": {

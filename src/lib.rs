@@ -88,10 +88,11 @@ pub use types::pointman::v1;
 pub use pane::{Pane, Refused, AUDIO_MAX, SEALING, VIDEO_FRAME_MAX};
 
 use protocol::{
-    CheckpointRequest, CommandCancelRequest, CommandCancelResponse, CommandId, CommandStartRequest,
-    CommandStartResponse, DoneRequest, EventRequest, FailedRequest, InitializeRequest, InitializeResponse,
-    OutputRequest, ProgressRequest, SecretGetRequest, SecretListRequest, ShutdownResponse,
+    CheckpointRequest, CommandCancelRequest, CommandCancelResponse, CommandStartRequest, CommandStartResponse,
+    DoneRequest, EventRequest, FailedRequest, InitializeRequest, InitializeResponse, OutputRequest, ProgressRequest,
+    SecretGetRequest, SecretListRequest, ShutdownResponse,
 };
+use v1::{CommandRef, SecretRef};
 
 /// The protocol version this SDK speaks: `PROTOCOL_TYPED`, the messages in standard JSON.
 pub const PROTOCOL: protocol::Protocol = protocol::Protocol::PROTOCOL_TYPED;
@@ -265,10 +266,10 @@ impl Handle {
         read(&self.0.node).clone()
     }
 
-    /// The machine's name (`this machine` before the node has said).
+    /// The machine's name, its hostname (`this machine` before the node has said).
     pub fn machine(&self) -> String {
         let node = read(&self.0.node);
-        match node.machine.as_option().map(|m| m.value.as_str()).filter(|m| !m.is_empty()) {
+        match node.machine.as_option().map(|m| m.name.as_str()).filter(|m| !m.is_empty()) {
             Some(machine) => machine.to_string(),
             None => "this machine".to_string(),
         }
@@ -345,10 +346,11 @@ impl Handle {
         from_json(result).with_context(|| format!("the node's answer to {} isn't its message", R::METHOD))
     }
 
-    /// A vault secret this extension may use (one `permissions.secrets` names or covers), opened by
+    /// A vault secret this extension may use (one `permissions.secrets` names or covers), by its name, opened by
     /// the node when it's needed. Never kept in settings or on disk.
     pub fn secret(&self, name: &str) -> anyhow::Result<String> {
-        let answer = self.request(&SecretGetRequest { name: name.to_string(), ..Default::default() })?;
+        let secret = SecretRef { name: name.to_string(), ..Default::default() };
+        let answer = self.request(&SecretGetRequest { secret: secret.into(), ..Default::default() })?;
         if answer.value.is_empty() {
             bail!("the node gave no value for the secret {name}");
         }
@@ -434,8 +436,8 @@ impl fmt::Debug for Job {
 }
 
 impl Job {
-    fn command_id(&self) -> CommandId {
-        CommandId { value: self.id.clone(), ..Default::default() }
+    fn command(&self) -> CommandRef {
+        CommandRef { id: self.id.clone(), ..Default::default() }
     }
 
     /// Whether the node has cancelled it.
@@ -464,7 +466,7 @@ impl Job {
         detail: Value,
     ) {
         self.handle.notify(&ProgressRequest {
-            id: self.command_id().into(),
+            command: self.command().into(),
             fraction: fraction.into(),
             stage: stage.into().map(String::from),
             detail: convert::to_struct(&detail).into(),
@@ -476,7 +478,7 @@ impl Job {
     pub fn save(&self, state: impl Serialize) {
         let state = convert::to_proto(&to_json(state));
         self.handle.notify(&CheckpointRequest {
-            id: self.command_id().into(),
+            command: self.command().into(),
             state: state.into(),
             ..Default::default()
         });
@@ -487,7 +489,7 @@ impl Job {
     /// `ContactSheet`.
     pub fn output(&self, path: impl AsRef<Path>, kind: &str, role: protocol::output_request::Role, meta: Value) {
         self.handle.notify(&OutputRequest {
-            id: self.command_id().into(),
+            command: self.command().into(),
             path: path.as_ref().to_string_lossy().into_owned(),
             kind: kind.to_string(),
             role: role.into(),
@@ -848,11 +850,12 @@ impl Extension {
         if !self.commands.contains_key(kind) {
             bail!("{kind} isn't a command of {}", self.handle.0.id);
         }
-        let cid =
-            p.id.as_option()
-                .map(|id| id.value.clone())
-                .filter(|id| !id.is_empty())
-                .context("command.start has no id")?;
+        let cid = p
+            .command
+            .as_option()
+            .map(|c| c.id.clone())
+            .filter(|id| !id.is_empty())
+            .context("command.start has no command")?;
         let mut jobs = lock(&self.jobs);
         if jobs.contains_key(&cid) {
             return Ok(to_json(CommandStartResponse { already: true, ..Default::default() }));
@@ -889,7 +892,7 @@ impl Extension {
 
     fn cancel(&self, params: Value) -> anyhow::Result<Value> {
         let p: CommandCancelRequest = from_params(params, "command.cancel")?;
-        let cid = p.id.as_option().map(|id| id.value.clone()).context("command.cancel has no id")?;
+        let cid = p.command.as_option().map(|c| c.id.clone()).context("command.cancel has no command")?;
         let found = lock(&self.jobs).get(&cid).map(|c| c.store(true, Ordering::SeqCst)).is_some();
         Ok(to_json(CommandCancelResponse { found, ..Default::default() }))
     }
@@ -943,9 +946,9 @@ impl Extension {
             guarded(|| f(&job))
         };
         let h = &self.handle;
-        let id = job.command_id();
+        let command = job.command();
         let failed = |error: String, retry: bool, cancelled: bool| FailedRequest {
-            id: id.clone().into(),
+            command: command.clone().into(),
             error,
             retry,
             cancelled,
@@ -953,7 +956,7 @@ impl Extension {
         };
         match outcome {
             Ok(result) => h.notify(&DoneRequest {
-                id: id.clone().into(),
+                command: command.clone().into(),
                 result: convert::to_proto(&result).into(),
                 ..Default::default()
             }),

@@ -181,15 +181,15 @@ fn a_video_pane_takes_control_inputs_only_while_a_grant_holds() {
     let refused = view.control_input(click.clone()).unwrap_err();
     assert!(refused.to_string().contains("control is off"), "{refused}");
 
-    view.control(Some(1_792_000_000), "james", "MacBook Pro").unwrap();
+    view.control(Some(1_792_000_000), "james", "macbook-pro").unwrap();
     assert_eq!(
         node.wait_event("video.control", WAIT).unwrap(),
-        json!({"grant": {"until": 1_792_000_000u64, "by": "james", "device": "MacBook Pro"}})
+        json!({"grant": {"until": 1_792_000_000u64, "by": "james", "device": "macbook-pro"}})
     );
     view.control_input(click.clone()).unwrap();
     assert_eq!(node.wait_event("video.controlled", WAIT).unwrap(), click);
 
-    view.control(None, "james", "MacBook Pro").unwrap();
+    view.control(None, "james", "macbook-pro").unwrap();
     assert_eq!(node.wait_event("video.control", WAIT).unwrap(), json!({"grant": null}));
     assert!(view.control_input(click).is_err());
     view.hint(10, 640).unwrap(); // hints never needed control
@@ -199,7 +199,7 @@ fn a_video_pane_takes_control_inputs_only_while_a_grant_holds() {
 fn a_grant_the_extension_turns_down_says_why() {
     let node = video();
     let view = node.open_pane("live", json!({"locked": true})).unwrap();
-    let refused = view.control(Some(1_792_000_000), "james", "MacBook Pro").unwrap_err();
+    let refused = view.control(Some(1_792_000_000), "james", "macbook-pro").unwrap_err();
     assert!(refused.to_string().contains("can't be controlled"), "{refused}");
-    view.control(None, "james", "MacBook Pro").unwrap(); // ending one that never held is fine
+    view.control(None, "james", "macbook-pro").unwrap(); // ending one that never held is fine
 }

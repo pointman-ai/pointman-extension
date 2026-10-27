@@ -13,13 +13,13 @@
   },
   "result": {
     "file": {
-      "value": "file_2636"
+      "id": "file_2636"
     },
     "version": {
-      "value": "ver_9001"
+      "id": "ver_9001"
     },
     "post": {
-      "value": "post_19455"
+      "id": "post_19455"
     }
   }
 }

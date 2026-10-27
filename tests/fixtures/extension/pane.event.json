@@ -2,7 +2,7 @@
   "method": "pane.event",
   "params": {
     "pane": {
-      "value": "pane_12"
+      "id": "pane_12"
     },
     "event": {
       "kind": "caption",
