@@ -2,18 +2,18 @@
   "method": "pane.open",
   "params": {
     "pane": {
-      "value": "pane_12"
+      "id": "pane_12"
     },
     "open": "live",
     "target": {},
     "context": {
       "thread": {
-        "value": "thr_17979"
+        "id": "thr_17979"
       }
     },
     "viewer": {
       "person": {
-        "handle": "james"
+        "name": "james"
       }
     }
   },

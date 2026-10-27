@@ -4,7 +4,7 @@
     "protocol": "PROTOCOL_TYPED",
     "node": "mac-m4",
     "machine": {
-      "value": "mac-m4"
+      "name": "mac-m4"
     },
     "settings": {
       "hours": 24.0

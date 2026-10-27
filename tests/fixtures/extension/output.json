@@ -1,8 +1,8 @@
 {
   "method": "output",
   "params": {
-    "id": {
-      "value": "req-412"
+    "command": {
+      "id": "req-412"
     },
     "path": "/w/resolve/req-412/cut.mov",
     "kind": "video",

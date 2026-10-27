@@ -2,7 +2,7 @@
   "method": "oauth.load",
   "params": {
     "person": {
-      "handle": "james"
+      "name": "james"
     }
   },
   "result": {

@@ -241,4 +241,42 @@ Python node and template against these, when `POINTMAN_CORE` points at a checkou
 (`POINTMAN_CORE_PYTHON`: a Python with its dependencies, if not its `.venv`). Without it, as on CI, those two are
 skipped.
 
+## Moving from 0.4 to 0.5: references are `{id, name}`
+
+0.5 speaks the protocol of a node from 0.4.0 on, and only that one: every reference to another object is its kind's
+`XRef` from `pointman.v1` (refs.proto), with an `id` (core's, `pane_12`) and, for kinds that have one, a `name` (a
+handle, a hostname, a task's ref). The `XId { value }` messages are gone. What the SDK does for you is unchanged:
+`Job::id`, `Pane::id`, `Handle::machine()` (the hostname) and `Handle::secret(name)` read and write the new shapes.
+Code that builds or reads protocol messages itself moves like this:
+
+| Where | 0.4 | 0.5 |
+|---|---|---|
+| Any id | `PaneId { value: x, .. }`, `p.pane.value` | `PaneRef { id: x, .. }`, `p.pane.id` |
+| A command's messages (command.start, command.cancel, progress, output, done, failed, checkpoint) | `id: protocol::CommandId { value }`; JSON `"id": {"value": "req-412"}` | `command: v1::CommandRef { id }`; JSON `"command": {"id": "req-412"}` |
+| initialize's `machine` | `machine.value` (`"mac-m4"`) | `machine.name` (`"mac-m4"`); `machine.id` is core's (`machine_7`) |
+| A member (a pane's viewer, pane.control's `by`, oauth.\*'s and mcp.\*'s `person`, oauth.people's `people`, agents.join's `agent`, a health part's `person`) | `MemberRef { kind: Some(member_ref::Kind::Handle(h)) }`, or `Kind::Id(MemberId { value })`; JSON `{"handle": "james"}` | `MemberRef { name: h, .. }`, or `MemberRef { id: "mem_5".into(), .. }`; JSON `{"name": "james"}` |
+| session.prepare, session.ended | `handle: MemberRef`, `run: RunId` | `agent: MemberRef`, `run: RunRef` |
+| agents.sessions' `AgentSessionOnMachine` | `handle`, `thread: ThreadId` | `agent`, `thread: ThreadRef` |
+| agents.\*'s `live` | `RunId { value }` | `RunRef { id }` |
+| credentials.\*'s `session` | `SignInId { value }` | `SignInRef { id }` |
+| secret.get | `SecretGetRequest { name }` | `SecretGetRequest { secret: SecretRef { name, .. }.into(), .. }` |
+| pane.control's `device` | `Option<String>`, its label (`"James's MacBook Pro"`) | `DeviceRef`, its short name in `name` (`"macbook-pro"`) |
+| `PaneContext` | `thread: ThreadId`, `post: PostId`, `file: FileId`, `item: Option<String>` (`"MB-12"`) | `ThreadRef`, `PostRef`, `FileRef`, `item: ItemRef` (`item.name` is `"MB-12"`) |
+| files.publish's answer | `FileId`, `FileVersionId`, `PostId` | `FileRef`, `FileVersionRef`, `PostRef` |
+| files.\*'s `OwnFile.by` | `MachineId { value }` | `MachineRef`, the hostname in `name` |
+| board.post | `thread: ThreadId`; `tasks: [TaskRef { kind: Some(task_ref::Kind::Ref("MB-12")) }]`; the answer's `post: PostId` | `thread: ThreadRef`; `tasks: [TaskRef { name: "MB-12".into(), .. }]` (or `id: "task_5"`); `post: PostRef` |
+| A block's `id` | `BlockId { value }` | a `String` |
+| Inside blocks (asks, list items, spawn cards, extension answers, waterfall and traces views) | `MemberId`, `MachineId`, `PostId`, `ThreadId`, `JobId`, `DeviceId`, `ExtensionId`; an ask's question and permission `id: QuestionId` / `PermissionId` | `MemberRef`, `MachineRef`, `PostRef`, `ThreadRef`, `JobRef`, `DeviceRef`, `ExtensionRef`; those two `id`s a `String` |
+
+In short: `.value` becomes `.id`, except a machine's, which becomes `.name`; a `MemberRef`'s `Kind::Handle` becomes
+`name`, and the `handle` field of session.prepare, session.ended and agents.sessions becomes `agent`. This finds what's
+left:
+
+```sh
+rg '\.value\b|member_ref::|task_ref::|handle:|Id \{ value'
+```
+
+In tests, `StandIn` answers `secret.get` by the secret's name, as a node does, and `PaneView::control(until, by,
+device)` takes the device's short name.
+
 The protocol and the manifest are documented in Pointman's docs/dev/extensions.md.

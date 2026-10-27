@@ -2,13 +2,15 @@
   "method": "pane.context",
   "params": {
     "pane": {
-      "value": "pane_12"
+      "id": "pane_12"
     },
     "context": {
       "thread": {
-        "value": "thr_5918"
+        "id": "thr_5918"
       },
-      "item": "TYPES-9"
+      "item": {
+        "name": "TYPES-9"
+      }
     }
   }
 }

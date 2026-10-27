@@ -2,7 +2,7 @@
   "method": "oauth.save",
   "params": {
     "person": {
-      "handle": "james"
+      "name": "james"
     },
     "data": {
       "access_token": "y"

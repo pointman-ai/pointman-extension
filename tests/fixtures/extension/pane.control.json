@@ -2,13 +2,15 @@
   "method": "pane.control",
   "params": {
     "pane": {
-      "value": "pane_12"
+      "id": "pane_12"
     },
     "until": "2026-10-24T01:00:00Z",
     "by": {
-      "handle": "james"
+      "name": "james"
     },
-    "device": "James's iPad"
+    "device": {
+      "name": "ipad"
+    }
   },
   "result": {}
 }

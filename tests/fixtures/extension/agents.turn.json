@@ -2,7 +2,7 @@
   "method": "agents.turn",
   "params": {
     "live": {
-      "value": "run_6296"
+      "id": "run_6296"
     },
     "seq": "9",
     "text": "Release 50 is live."

@@ -1,8 +1,8 @@
 {
   "method": "done",
   "params": {
-    "id": {
-      "value": "req-412"
+    "command": {
+      "id": "req-412"
     },
     "result": {
       "frames": 250.0

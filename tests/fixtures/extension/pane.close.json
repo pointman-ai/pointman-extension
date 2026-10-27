@@ -2,7 +2,7 @@
   "method": "pane.close",
   "params": {
     "pane": {
-      "value": "pane_12"
+      "id": "pane_12"
     },
     "reason": "closed"
   }

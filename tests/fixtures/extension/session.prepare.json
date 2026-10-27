@@ -2,10 +2,10 @@
   "method": "session.prepare",
   "params": {
     "run": {
-      "value": "run_6296"
+      "id": "run_6296"
     },
-    "handle": {
-      "handle": "loupe"
+    "agent": {
+      "name": "loupe"
     },
     "client": "claude",
     "folder": "/Users/me/Documents",

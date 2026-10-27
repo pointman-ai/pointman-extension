@@ -45,13 +45,15 @@ use crate::protocol::pane_audio_request::Sound as SoundOf;
 use crate::protocol::pane_open_response::First;
 use crate::protocol::pane_open_response::Video;
 use crate::protocol::{
-    CheckpointRequest, CommandCancelRequest, CommandId, CommandStartRequest, DoneRequest, EventRequest, FailedRequest,
+    CheckpointRequest, CommandCancelRequest, CommandStartRequest, DoneRequest, EventRequest, FailedRequest,
     InitializeRequest, InitializeResponse, OutputRequest, PaneClosedRequest, PaneEditRequest, PaneInputRequest,
     PaneOpenRequest, PaneOpenResponse, PaneSetRequest, PaneTitleRequest, PaneViewer, ProgressRequest, SecretGetRequest,
     SecretGetResponse, SecretListRequest, SecretListResponse,
 };
 use crate::protocol::{PaneAudioRequest, PaneControlRequest, PaneFrameRequest, PaneViewersRequest};
-use crate::v1::{Block, MachineId, MemberRef, PaneContent, PaneContext, PaneFormat, PaneId, PaneInput};
+use crate::v1::{
+    Block, CommandRef, DeviceRef, MachineRef, MemberRef, PaneContent, PaneContext, PaneFormat, PaneInput, PaneRef,
+};
 use crate::{
     convert, edits, from_params, guarded, id_text, load_manifest, lock, resolve, Request, AUDIO_MAX, PROTOCOL, SEALING,
     VIDEO_FRAME_MAX,
@@ -152,8 +154,7 @@ pub struct PaneOptions {
 
 impl Default for PaneOptions {
     fn default() -> Self {
-        let person =
-            MemberRef { kind: Some(crate::v1::member_ref::Kind::Handle("james".into())), ..Default::default() };
+        let person = MemberRef { name: "james".into(), ..Default::default() };
         PaneOptions {
             context: PaneContext::default(),
             viewer: PaneViewer { person: person.into(), ..Default::default() },
@@ -416,7 +417,7 @@ impl StandIn {
         let hello = InitializeRequest {
             protocol: PROTOCOL.into(),
             node: self.node.clone(),
-            machine: MachineId { value: self.machine.clone(), ..Default::default() }.into(),
+            machine: MachineRef { name: self.machine.clone(), ..Default::default() }.into(),
             settings: convert::to_struct(&self.settings).into(),
             work_dir: work_dir.to_string_lossy().into_owned(),
             state_dir: state_dir.to_string_lossy().into_owned(),
@@ -492,7 +493,7 @@ impl StandIn {
         lock(&s.runs).insert(cid.clone(), (Done::default(), tx));
         let params = if params.is_null() { json!({}) } else { params };
         let start = CommandStartRequest {
-            id: CommandId { value: cid.clone(), ..Default::default() }.into(),
+            command: CommandRef { id: cid.clone(), ..Default::default() }.into(),
             kind: kind.to_string(),
             params: convert::to_struct(&params).into(),
             work: live.work_dir.join(&cid).to_string_lossy().into_owned(),
@@ -516,8 +517,8 @@ impl StandIn {
 
     /// Cancel a running command, by its id: whether the extension was running it.
     pub fn cancel(&self, cid: &str) -> Result<bool, Failed> {
-        let id = CommandId { value: cid.to_string(), ..Default::default() };
-        let request = CommandCancelRequest { id: id.into(), ..Default::default() };
+        let command = CommandRef { id: cid.to_string(), ..Default::default() };
+        let request = CommandCancelRequest { command: command.into(), ..Default::default() };
         let answer = self.live()?.shared.request(
             "command.cancel",
             serde_json::to_value(request).unwrap_or_default(),
@@ -547,7 +548,7 @@ impl StandIn {
         let view = Arc::new(View { id: pid.clone(), state: Mutex::default(), changed: Condvar::new() });
         lock(&s.panes).insert(pid.clone(), view.clone());
         let params = serde_json::to_value(PaneOpenRequest {
-            pane: PaneId { value: pid.clone(), ..Default::default() }.into(),
+            pane: PaneRef { id: pid.clone(), ..Default::default() }.into(),
             open: open.to_string(),
             target: convert::to_struct(&target).into(),
             context: options.context.clone().into(),
@@ -813,8 +814,14 @@ impl Shared {
                 .collect();
             Ok(serde_json::to_value(SecretListResponse { names, ..Default::default() }).unwrap_or_default())
         } else if method == "secret.get" {
-            let name = crate::from_json::<SecretGetRequest>(params).map(|r| r.name).unwrap_or_default();
-            if !allows_secret(&self.allowed, &name) {
+            let name = crate::from_json::<SecretGetRequest>(params)
+                .ok()
+                .and_then(|r| r.secret.into_option())
+                .map(|s| s.name)
+                .unwrap_or_default();
+            if name.is_empty() {
+                Err("which secret? the node checks a secret.get by its name".to_string())
+            } else if !allows_secret(&self.allowed, &name) {
                 Err(format!("{} may not use the secret '{name}': it isn't in its permissions", self.id))
             } else {
                 match self.secrets.get(&name) {
@@ -839,7 +846,7 @@ impl Shared {
         let method = msg["method"].as_str().unwrap_or_default();
         let p = &msg["params"];
         if method.starts_with("pane.") {
-            let pane = p.get("pane").and_then(|pane| pane.get("value")).map(id_text).unwrap_or_default();
+            let pane = p.get("pane").and_then(|pane| pane.get("id")).map(id_text).unwrap_or_default();
             let view = lock(&self.panes).get(&pane).cloned();
             if let Some(view) = view {
                 view.took(method, p, true);
@@ -854,7 +861,7 @@ impl Shared {
             }
             return;
         }
-        let cid = p.get("id").and_then(|id| id.get("value")).map(id_text).unwrap_or_default();
+        let cid = p.get("command").and_then(|c| c.get("id")).map(id_text).unwrap_or_default();
         let mut runs = lock(&self.runs);
         let Some((record, _)) = runs.get_mut(&cid) else { return };
         match method {
@@ -1012,7 +1019,7 @@ impl PaneView {
     /// refusal is a [`Failed`] whose message is the extension's reason.
     pub fn input(&self, event: PaneInput) -> Result<(), Failed> {
         let request = PaneInputRequest {
-            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            pane: PaneRef { id: self.view.id.clone(), ..Default::default() }.into(),
             event: event.into(),
             ..Default::default()
         };
@@ -1031,7 +1038,7 @@ impl PaneView {
     /// `pane.viewers`.
     pub fn viewers(&self, attached: u64) -> Result<(), Failed> {
         let request = PaneViewersRequest {
-            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            pane: PaneRef { id: self.view.id.clone(), ..Default::default() }.into(),
             attached: attached as i32,
             ..Default::default()
         };
@@ -1051,18 +1058,18 @@ impl PaneView {
     }
 
     /// The node gives a person control of a `video` pane (`pane.control`: `until` in unix seconds, `by` their handle,
-    /// and their `device`), or ends it (`until` None). Waits for the extension's answer: a refusal is a [`Failed`]
-    /// whose message is its reason.
+    /// and their `device`'s short name, `macbook-pro`), or ends it (`until` None). Waits for the extension's answer: a
+    /// refusal is a [`Failed`] whose message is its reason.
     pub fn control(&self, until: Option<u64>, by: &str, device: &str) -> Result<(), Failed> {
-        let person =
-            MemberRef { kind: Some(crate::v1::member_ref::Kind::Handle(by.to_string())), ..Default::default() };
+        let person = MemberRef { name: by.to_string(), ..Default::default() };
+        let device = DeviceRef { name: device.to_string(), ..Default::default() };
         let request = PaneControlRequest {
-            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            pane: PaneRef { id: self.view.id.clone(), ..Default::default() }.into(),
             until: until
                 .map(|s| buffa_types::google::protobuf::Timestamp { seconds: s as i64, ..Default::default() })
                 .into(),
             by: person.into(),
-            device: Some(device.to_string()),
+            device: device.into(),
             ..Default::default()
         };
         self.shared.request("pane.control", serde_json::to_value(request).unwrap_or_default(), CALL_TIMEOUT).map(drop)
@@ -1078,7 +1085,7 @@ impl PaneView {
     /// What the person is looking at changed: `pane.context`.
     pub fn look_at(&self, context: PaneContext) -> Result<(), Failed> {
         let request = crate::protocol::PaneContextRequest {
-            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            pane: PaneRef { id: self.view.id.clone(), ..Default::default() }.into(),
             context: context.into(),
             ..Default::default()
         };
@@ -1088,7 +1095,7 @@ impl PaneView {
     /// Close it from the node's side, as core does when the app goes.
     pub fn close(&self, reason: &str) -> Result<(), Failed> {
         let request = crate::protocol::PaneCloseRequest {
-            pane: PaneId { value: self.view.id.clone(), ..Default::default() }.into(),
+            pane: PaneRef { id: self.view.id.clone(), ..Default::default() }.into(),
             reason: reason.to_string(),
             ..Default::default()
         };

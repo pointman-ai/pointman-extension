@@ -20,7 +20,7 @@ fn demo() -> StandIn {
 
 /// One of the node's own requests: `mcp.call_tool` stands in for any, `ask` or `relay` by name.
 fn tool(node: &StandIn, name: &str, arguments: Value) -> Result<Value, pointman_extension::testing::Failed> {
-    let call = json!({"person": {"handle": "james"}, "name": name, "arguments": arguments});
+    let call = json!({"person": {"name": "james"}, "name": name, "arguments": arguments});
     node.call("mcp.call_tool", call).map(|answer| answer["result"].clone())
 }
 
@@ -66,7 +66,7 @@ fn it_starts_with_the_node_and_the_settings_defaults() {
     let n = &started["node"];
     assert_eq!(
         (n["protocol"].clone(), n["node"].clone(), n["machine"].clone()),
-        (json!("PROTOCOL_TYPED"), json!("test-node"), json!({"value": "test-machine"}))
+        (json!("PROTOCOL_TYPED"), json!("test-node"), json!({"name": "test-machine"}))
     );
     assert_eq!(n["workDir"], json!(node.work_dir()));
     assert_eq!(n["stateDir"], json!(node.state_dir_path()));
@@ -178,7 +178,7 @@ fn secrets_only_within_its_permissions() {
         json!({"names": ["demo.spare", "demo.work", "shared.key"]})
     );
     let asked = node.asked();
-    assert_eq!(asked[0], ("secret.get".to_string(), json!({"name": "demo.work"})));
+    assert_eq!(asked[0], ("secret.get".to_string(), json!({"secret": {"name": "demo.work"}})));
     assert_eq!(asked.last().unwrap(), &("secret.list".to_string(), json!({}))); // an empty prefix is the default, and left out
 }
 

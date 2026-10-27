@@ -2,7 +2,7 @@
   "method": "mcp.status",
   "params": {
     "person": {
-      "handle": "james"
+      "name": "james"
     }
   },
   "result": {

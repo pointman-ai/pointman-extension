@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{example, source};
 use pointman_extension::testing::{PaneOptions, PaneView, StandIn};
-use pointman_extension::v1::{PaneContext, PaneFormat, ThreadId};
+use pointman_extension::v1::{PaneContext, PaneFormat, ThreadRef};
 use pointman_extension::Extension;
 use serde_json::{json, Value};
 
@@ -34,7 +34,7 @@ fn count(block: Option<pointman_extension::v1::Block>) -> Value {
 #[test]
 fn a_pane_opens_with_its_manifest_format_and_inputs_edit_it() {
     let node = panes();
-    let thread = ThreadId { value: "thr_1".into(), ..Default::default() };
+    let thread = ThreadRef { id: "thr_1".into(), ..Default::default() };
     let options =
         PaneOptions { context: PaneContext { thread: thread.into(), ..Default::default() }, ..Default::default() };
     let view = node.open_pane_with("counter", json!({"start": 1}), options).unwrap();
@@ -46,7 +46,7 @@ fn a_pane_opens_with_its_manifest_format_and_inputs_edit_it() {
     view.wait(WAIT, |v| v.title().as_deref() == Some("Counter from 1")).unwrap();
     assert_eq!(
         view.frames()[0],
-        ("pane.title".to_string(), json!({"pane": {"value": view.id()}, "title": "Counter from 1"}))
+        ("pane.title".to_string(), json!({"pane": {"id": view.id()}, "title": "Counter from 1"}))
     );
 
     for _ in 0..3 {
@@ -91,7 +91,7 @@ fn a_refused_input_says_why_and_changes_nothing() {
 fn context_and_close_reach_the_pane() {
     let node = panes();
     let view = node.open_pane("counter", Value::Null).unwrap();
-    let thread = ThreadId { value: "thr_9".into(), ..Default::default() };
+    let thread = ThreadRef { id: "thr_9".into(), ..Default::default() };
     view.look_at(PaneContext { thread: thread.into(), ..Default::default() }).unwrap();
     view.wait(WAIT, |v| v.block("seen").is_some_and(|b| json_of(Some(b))["text"]["markdown"] == "Looking at thr_9"))
         .unwrap();
@@ -109,7 +109,7 @@ fn the_extension_closes_a_pane_itself() {
     let view = node.open_pane("counter", Value::Null).unwrap();
     view.input_json(tap("stop")).unwrap();
     view.wait(WAIT, |v| v.closed().as_deref() == Some("stopped")).unwrap();
-    let closed = ("pane.closed".to_string(), json!({"pane": {"value": view.id()}, "reason": "stopped"}));
+    let closed = ("pane.closed".to_string(), json!({"pane": {"id": view.id()}, "reason": "stopped"}));
     assert!(view.frames().contains(&closed), "{:?}", view.frames());
     assert_eq!(node.wait_event("panes.closed", WAIT).unwrap()["reason"], "stopped");
     assert!(view.input_json(tap("plus")).unwrap_err().message.starts_with("no pane"));

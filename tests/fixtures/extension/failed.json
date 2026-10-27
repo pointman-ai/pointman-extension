@@ -1,8 +1,8 @@
 {
   "method": "failed",
   "params": {
-    "id": {
-      "value": "req-413"
+    "command": {
+      "id": "req-413"
     },
     "error": "Resolve isn't open",
     "retry": true,
