@@ -251,6 +251,7 @@ Code that builds or reads protocol messages itself moves like this:
 
 | Where | 0.4 | 0.5 |
 |---|---|---|
+| extension.toml's `node` | `node = ">=0.2.0"`, or any range that takes a node before 0.4.0 | `node = ">=0.4.0"`. Without it, an older node still installs the extension, and it fails at its first command |
 | Any id | `PaneId { value: x, .. }`, `p.pane.value` | `PaneRef { id: x, .. }`, `p.pane.id` |
 | A command's messages (command.start, command.cancel, progress, output, done, failed, checkpoint) | `id: protocol::CommandId { value }`; JSON `"id": {"value": "req-412"}` | `command: v1::CommandRef { id }`; JSON `"command": {"id": "req-412"}` |
 | initialize's `machine` | `machine.value` (`"mac-m4"`) | `machine.name` (`"mac-m4"`); `machine.id` is core's (`machine_7`) |
@@ -268,9 +269,9 @@ Code that builds or reads protocol messages itself moves like this:
 | A block's `id` | `BlockId { value }` | a `String` |
 | Inside blocks (asks, list items, spawn cards, extension answers, waterfall and traces views) | `MemberId`, `MachineId`, `PostId`, `ThreadId`, `JobId`, `DeviceId`, `ExtensionId`; an ask's question and permission `id: QuestionId` / `PermissionId` | `MemberRef`, `MachineRef`, `PostRef`, `ThreadRef`, `JobRef`, `DeviceRef`, `ExtensionRef`; those two `id`s a `String` |
 
-In short: `.value` becomes `.id`, except a machine's, which becomes `.name`; a `MemberRef`'s `Kind::Handle` becomes
-`name`, and the `handle` field of session.prepare, session.ended and agents.sessions becomes `agent`. This finds what's
-left:
+In short: raise `node` in extension.toml to `">=0.4.0"`; `.value` becomes `.id`, except a machine's, which becomes
+`.name`; a `MemberRef`'s `Kind::Handle` becomes `name`, and the `handle` field of session.prepare, session.ended and
+agents.sessions becomes `agent`. This finds what's left:
 
 ```sh
 rg '\.value\b|member_ref::|task_ref::|handle:|Id \{ value'

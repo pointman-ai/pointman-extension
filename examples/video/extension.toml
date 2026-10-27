@@ -6,7 +6,7 @@ name = "Video"
 version = "0.1.0"
 publisher = "aurelio"
 summary = "A video pane of made-up frames, for the Rust SDK's own tests."
-node = ">=0.1,<1"
+node = ">=0.4,<1"
 platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
 
 [run]
