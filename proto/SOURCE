@@ -1,2 +1,2 @@
-core: pointman-ai/pointman f6af1fbe
+core: pointman-ai/pointman f6af1fbe, with BoardPostRequest's side_of (= 6) from c8dde95a8 (EXT-103)
 from: src/pointman/descriptors.pb, closure of pointman/extension/v1/protocol.proto
