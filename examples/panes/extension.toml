@@ -7,7 +7,7 @@ name = "Panes"
 version = "0.1.0"
 publisher = "aurelio"
 summary = "Every kind of pane the Rust SDK opens, for its own tests."
-node = ">=0.4,<1"
+node = ">=0.4.1,<1"
 platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
 
 [run]
