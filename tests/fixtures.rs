@@ -31,7 +31,7 @@ fn every_method_has_a_fixture_and_every_fixture_a_method() {
     let mut methods: Vec<String> = METHODS.iter().map(|m| m.method.to_string()).collect();
     methods.sort();
     assert_eq!(files, methods);
-    assert_eq!(METHODS.len(), 60, "20 + 10 requests and notifications to the extension, 16 + 14 to the node");
+    assert_eq!(METHODS.len(), 62, "20 + 10 requests and notifications to the extension, 18 + 14 to the node");
     let to_extension = METHODS.iter().filter(|m| m.side == Side::Process).count();
     assert_eq!(to_extension, 30);
 }

@@ -20,7 +20,7 @@ method's params and result are that method's messages, in protobuf's standard JS
 
 - A method's name is its rpc's: `PaneOpen` is `pane.open`, `CredentialsSignIn` is `credentials.sign_in`. An rpc that
   returns `Empty` is a notification (`Notification`); the rest are requests (`Request`, with their `Response`).
-  `pointman_extension::METHODS` lists all 60.
+  `pointman_extension::METHODS` lists all 62.
 - Lists stay open: an unknown method, field or enum value is skipped, never refused. A request for a method the SDK
   doesn't know is answered with an error; a notification is dropped.
 - An extension's own data (its settings, a command's params and result, its events, a board's items) is free-form in
@@ -58,6 +58,7 @@ fn main() -> anyhow::Result<()> {
     let names = h.secrets("rota.")?; // SecretListRequest; waits up to 30 s
     let token = h.secret("rota.work")?; // SecretGetRequest
     // any request to the node by its message: h.request(&BoardPostRequest { .. })? -> BoardPostResponse
+    // its error is a HostError: the node's reason, and core's code when it gave one (e.downcast_ref::<HostError>())
     // any notification: h.notify(&PaneTitleRequest { .. })
     let (settings, node) = (h.settings(), h.node()); // node: the InitializeRequest (node, machine, work_dir, state_dir, roots)
     let path = h.allowed("/some/path")?; // inside the node's roots, or an error
@@ -71,6 +72,24 @@ its own. Settings get the defaults from the manifest's `[settings]` schema (a ch
 `settings.changed`). Callbacks may return `()` or a `Result`; a panic in one fails that command (or is logged) and the
 extension carries on. Numbers in free-form data come back as integers when they are whole (protobuf's `Value` has one
 kind of number).
+
+## Signing in with Pointman's shared OAuth client
+
+A `[[credentials]]` form with `sign_in = true` may say `shared_client = "google"`: on a core that has Pointman's own
+client for that provider, `credentials.sign_in`'s `redirect_uri` is the shared client's (the cloud's callback), and the
+extension exchanges and refreshes through core, so the client's secret never reaches it. On a core with none (a
+self-hosted one), `shared` is false and `redirect_uri` is core's own `/oauth/callback`: use the extension's own client.
+
+```rust
+let client = h.oauth_shared_client("google")?; // OauthSharedClientResponse: shared, client_id, redirect_uri
+let tokens = h.oauth_token("google", &code, &verifier, &redirect_uri)?; // the provider's own answer
+let fresh = h.oauth_refresh("google", &refresh_token)?;
+// core's refusal: a HostError with core's code. invalid_grant: sign in again; upstream: try later
+if let Some(e) = err.downcast_ref::<pointman_extension::HostError>() { /* e.code.as_deref() */ }
+```
+
+Only for a provider one of the manifest's sign-in forms names; another is refused before anything is asked. Never log a
+code, a verifier or a token. `examples/signin` is one, with its tests in `tests/signin.rs`.
 
 ## Your own proto (recommended, not required)
 
@@ -212,6 +231,7 @@ let node = StandIn::new(env!("CARGO_MANIFEST_DIR"))     // the folder with exten
     .env("PATH", path).machine("test-machine")          // also .node, .state_dir, .roots
     .on(|_: OauthLoadRequest| Ok(OauthLoadResponse::default())) // more the extension may ask the node, by message
     .method("oauth.load", |p| Ok(json!({})))            // or by name, with JSON
+    .on(|_: OauthTokenRequest| Err(HostError::with_code("Bad Request", "invalid_grant").into())) // core's refusal
     .start()?;                                          // stops when dropped, or .stop()
 let done = node.run("rota.swap", json!({}))?;           // .result .progress .outputs .checkpoints (the messages it sent)
 node.run_with("rota.swap", json!({}), RunOptions { cid: Some("c1".into()), ..Default::default() })?;
