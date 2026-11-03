@@ -1,0 +1,19 @@
+{
+  "method": "oauth.token",
+  "params": {
+    "provider": "google",
+    "code": {
+      "code": "4/0Ab-x",
+      "verifier": "v-123",
+      "redirectUri": "https://api.pointman.ai/v1/oauth/google/callback"
+    }
+  },
+  "result": {
+    "accessToken": "ya29.x",
+    "expiresIn": "3599",
+    "tokenType": "Bearer",
+    "scope": "https://www.googleapis.com/auth/calendar",
+    "refreshToken": "1//0g-x",
+    "idToken": "eyJ.x.y"
+  }
+}
