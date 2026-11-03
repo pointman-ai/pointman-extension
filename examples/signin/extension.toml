@@ -1,0 +1,29 @@
+# A sign-in with Pointman's shared OAuth client, for the SDK's own tests (tests/signin.rs): its form names the
+# provider as its shared_client, so the node gives it the shared client and exchanges and refreshes through core.
+[extension]
+id = "signin"
+name = "Sign-in"
+version = "0.1.0"
+publisher = "aurelio"
+summary = "A sign-in with Pointman's shared OAuth client, for the SDK's own tests."
+node = ">=0.4.12,<1"
+platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
+
+[run]
+command = ["bin/signin"]
+runtime = "binary"
+
+[permissions]
+secrets = ["signin.*"]
+
+[[credentials]]
+id = "account"
+title = "Google account"
+item = "signin.{label}"
+sign_in = true
+shared_client = "google"
+
+[[commands]]
+kind = "signin.try"
+title = "Ask the node for the shared client, or a token through it"
+params = {type = "object", required = ["what", "provider"]}

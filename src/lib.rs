@@ -88,9 +88,10 @@ pub use types::pointman::v1;
 pub use pane::{Pane, Refused, AUDIO_MAX, SEALING, VIDEO_FRAME_MAX};
 
 use protocol::{
-    CheckpointRequest, CommandCancelRequest, CommandCancelResponse, CommandStartRequest, CommandStartResponse,
-    DoneRequest, EventRequest, FailedRequest, InitializeRequest, InitializeResponse, OutputRequest, ProgressRequest,
-    SecretGetRequest, SecretListRequest, ShutdownResponse,
+    oauth_token_request, CheckpointRequest, CommandCancelRequest, CommandCancelResponse, CommandStartRequest,
+    CommandStartResponse, DoneRequest, EventRequest, FailedRequest, InitializeRequest, InitializeResponse,
+    OauthCodeGrant, OauthSharedClientRequest, OauthSharedClientResponse, OauthTokenRequest, OauthTokenResponse,
+    OutputRequest, ProgressRequest, SecretGetRequest, SecretListRequest, ShutdownResponse,
 };
 use v1::{CommandRef, SecretRef};
 
@@ -179,6 +180,50 @@ impl fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
+/// The node turned a request down ([`Handle::request`]): its reason, and core's short word for it when core gave one
+/// (the JSON-RPC error's `data.code`), to branch on: `invalid_grant` (sign in again) or `upstream` (try later) from
+/// [`Handle::oauth_token`]. A request's error is one of these: `e.downcast_ref::<HostError>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostError {
+    pub message: String,
+    pub code: Option<String>,
+}
+
+impl HostError {
+    pub fn new(message: impl Into<String>) -> Self {
+        HostError { message: message.into(), code: None }
+    }
+
+    /// With core's code: what a stand-in's fake returns for core's refusal (`invalid_grant`).
+    pub fn with_code(message: impl Into<String>, code: impl Into<String>) -> Self {
+        HostError { message: message.into(), code: Some(code.into()) }
+    }
+
+    /// The JSON-RPC error a node sends for it: `data.code` only when there's a code.
+    pub fn to_error(&self) -> Value {
+        let mut e = json!({"code": -32000, "message": self.message});
+        if let Some(code) = &self.code {
+            e["data"] = json!({"code": code});
+        }
+        e
+    }
+
+    /// Read from a JSON-RPC error.
+    pub fn from_error(e: &Value) -> Self {
+        let message = e.get("message").and_then(Value::as_str).map(String::from).unwrap_or_else(|| e.to_string());
+        let code = e.pointer("/data/code").and_then(Value::as_str).filter(|c| !c.is_empty()).map(String::from);
+        HostError { message, code }
+    }
+}
+
+impl fmt::Display for HostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostError {}
+
 /// What an `on_start` or `every` callback may return: nothing, or a `Result`. An error is logged.
 pub trait Outcome {
     fn into_result(self) -> anyhow::Result<()>;
@@ -223,7 +268,7 @@ struct Shared {
     settings: RwLock<Value>,
     node: RwLock<InitializeRequest>,
     events: Mutex<HashMap<String, Value>>,
-    answers: Mutex<HashMap<String, Sender<Result<Value, String>>>>,
+    answers: Mutex<HashMap<String, Sender<Result<Value, HostError>>>>,
     calls: AtomicU64,
     panes: Mutex<HashMap<String, Pane>>,
 }
@@ -324,7 +369,7 @@ impl Handle {
     }
 
     /// Ask the node something (`SecretListRequest`, `OauthLoadRequest`…), and wait up to 30 s for its answer.
-    /// An error carries the node's reason.
+    /// An error carries the node's reason: a [`HostError`], with core's code when core gave one.
     pub fn request<R: Request>(&self, params: &R) -> anyhow::Result<R::Response> {
         self.request_timeout(params, REQUEST_TIMEOUT)
     }
@@ -339,7 +384,7 @@ impl Handle {
         lock(&self.0.answers).remove(&rid);
         let result = match answer {
             Err(_) => bail!("the node didn't answer {}", R::METHOD),
-            Ok(Err(reason)) => return Err(anyhow!(reason)),
+            Ok(Err(refused)) => return Err(refused.into()),
             Ok(Ok(Value::Null)) => json!({}),
             Ok(Ok(result)) => result,
         };
@@ -360,6 +405,50 @@ impl Handle {
     /// The names of the vault's items under a prefix its permissions cover, sorted.
     pub fn secrets(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
         Ok(self.request(&SecretListRequest { prefix: prefix.to_string(), ..Default::default() })?.names)
+    }
+
+    /// Core's shared OAuth client for a provider a sign-in form of the manifest names as its `shared_client`
+    /// (`google`): `shared`, its `client_id`, and the `redirect_uri` its sign-ins come back to (the one
+    /// `credentials.sign_in` gives too). `shared` false: this core has none (a self-hosted core), so the extension
+    /// uses its own client. The node asks core again for `credentials.sign_in`'s `redirect_uri`, so core's answer can
+    /// change between the two: use the shared client only when that `redirect_uri` is this one, and refuse the
+    /// sign-in when they differ.
+    pub fn oauth_shared_client(&self, provider: &str) -> anyhow::Result<OauthSharedClientResponse> {
+        self.request(&OauthSharedClientRequest { provider: provider.to_string(), ..Default::default() })
+    }
+
+    /// A sign-in's code exchanged with the provider's shared client, through core, which never holds its secret:
+    /// with the PKCE verifier and the `redirect_uri` the sign-in was sent to. The provider's own answer
+    /// (`access_token`, `refresh_token`…); a [`HostError`] with core's code when it refuses (`invalid_grant`). Never
+    /// log what goes in or comes back.
+    pub fn oauth_token(
+        &self,
+        provider: &str,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> anyhow::Result<OauthTokenResponse> {
+        let grant = OauthCodeGrant {
+            code: code.to_string(),
+            verifier: verifier.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            ..Default::default()
+        };
+        self.request(&OauthTokenRequest {
+            provider: provider.to_string(),
+            grant: Some(oauth_token_request::Grant::Code(Box::new(grant))),
+            ..Default::default()
+        })
+    }
+
+    /// A refresh token refreshed with the provider's shared client, through core: as [`Handle::oauth_token`].
+    /// `invalid_grant` means the person signs in again; `upstream` that it's worth trying later.
+    pub fn oauth_refresh(&self, provider: &str, refresh_token: &str) -> anyhow::Result<OauthTokenResponse> {
+        self.request(&OauthTokenRequest {
+            provider: provider.to_string(),
+            grant: Some(oauth_token_request::Grant::RefreshToken(refresh_token.to_string())),
+            ..Default::default()
+        })
     }
 
     /// A path a command was given, resolved, if it's inside a folder the node allows (its roots,
@@ -396,9 +485,7 @@ impl Handle {
         let key = rid.map(id_text).unwrap_or_default();
         if let Some(tx) = lock(&self.0.answers).get(&key) {
             let answer = match msg.get("error") {
-                Some(e) if !e.is_null() => {
-                    Err(e.get("message").and_then(Value::as_str).map(String::from).unwrap_or_else(|| e.to_string()))
-                }
+                Some(e) if !e.is_null() => Err(HostError::from_error(e)),
                 _ => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
             };
             let _ = tx.send(answer);
