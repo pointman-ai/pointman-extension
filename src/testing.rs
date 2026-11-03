@@ -55,8 +55,8 @@ use crate::v1::{
     Block, CommandRef, DeviceRef, MachineRef, MemberRef, PaneContent, PaneContext, PaneFormat, PaneInput, PaneRef,
 };
 use crate::{
-    convert, edits, from_params, guarded, id_text, load_manifest, lock, resolve, Request, AUDIO_MAX, PROTOCOL, SEALING,
-    VIDEO_FRAME_MAX,
+    convert, edits, from_params, guarded, id_text, load_manifest, lock, resolve, HostError, Request, AUDIO_MAX,
+    PROTOCOL, SEALING, VIDEO_FRAME_MAX,
 };
 
 /// What a stand-in passes on from its own environment, as a node does: never the board's tokens.
@@ -240,7 +240,10 @@ impl StandIn {
     }
 
     /// Anything more it may ask the node (an mcp extension's `oauth.load`), answered by `f` with the request and
-    /// the answer as their messages. An error goes back to the extension as the node's reason.
+    /// the answer as their messages. An error goes back to the extension as the node's reason; a [`HostError`] with
+    /// a code (`HostError::with_code("Bad Request", "invalid_grant")`) is core's refusal, its code kept as the node
+    /// keeps it. `oauth.shared_client` and `oauth.token` reach a fake only for a provider a sign-in form of the
+    /// manifest names as its `shared_client`, as on the node.
     pub fn on<R, F>(mut self, f: F) -> Self
     where
         R: Request,
@@ -370,9 +373,19 @@ impl StandIn {
             .filter_map(Value::as_str)
             .map(String::from)
             .collect();
+        // the providers its sign-in forms name as their shared_client: oauth.* is refused for any other, as on the node
+        let shared_clients = manifest["credentials"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["sign_in"] == true)
+            .filter_map(|c| c["shared_client"].as_str())
+            .map(String::from)
+            .collect();
         let shared = Arc::new(Shared {
             id,
             allowed,
+            shared_clients,
             secrets: self.secrets.clone(),
             methods: self.methods.clone(),
             child: Mutex::new(child),
@@ -662,6 +675,7 @@ type Running = (Done, Sender<Result<Done, Failed>>);
 struct Shared {
     id: String,
     allowed: Vec<String>,
+    shared_clients: Vec<String>,
     secrets: BTreeMap<String, String>,
     methods: HashMap<String, MethodFn>,
     child: Mutex<Child>,
@@ -802,8 +816,18 @@ impl Shared {
             Some(p) => p.clone(),
         };
         lock(&self.asked).push((method.clone(), params.clone()));
-        let reply: Result<Value, String> = if let Some(f) = self.methods.get(&method) {
-            guarded(|| f(params)).map_err(|e| format!("{e:#}"))
+        let provider = params["provider"].as_str().unwrap_or_default().to_string();
+        let reply: Result<Value, HostError> = if matches!(method.as_str(), "oauth.shared_client" | "oauth.token")
+            && !self.shared_clients.contains(&provider)
+        {
+            let id = &self.id;
+            let why = format!("{id} may not use a shared {provider:?} client: none of its sign-in forms names it");
+            Err(HostError::new(why))
+        } else if let Some(f) = self.methods.get(&method) {
+            guarded(|| f(params)).map_err(|e| HostError {
+                message: format!("{e:#}"),
+                code: e.downcast_ref::<HostError>().and_then(|h| h.code.clone()),
+            })
         } else if method == "secret.list" {
             let prefix = crate::from_json::<SecretListRequest>(params).map(|r| r.prefix).unwrap_or_default();
             let names: Vec<String> = self
@@ -820,25 +844,25 @@ impl Shared {
                 .map(|s| s.name)
                 .unwrap_or_default();
             if name.is_empty() {
-                Err("which secret? the node checks a secret.get by its name".to_string())
+                Err(HostError::new("which secret? the node checks a secret.get by its name"))
             } else if !allows_secret(&self.allowed, &name) {
-                Err(format!("{} may not use the secret '{name}': it isn't in its permissions", self.id))
+                Err(HostError::new(format!("{} may not use the secret '{name}': it isn't in its permissions", self.id)))
             } else {
                 match self.secrets.get(&name) {
                     Some(value) => {
                         Ok(serde_json::to_value(SecretGetResponse { value: value.clone(), ..Default::default() })
                             .unwrap_or_default())
                     }
-                    None => Err(format!("no secret '{name}' in the vault")),
+                    None => Err(HostError::new(format!("no secret '{name}' in the vault"))),
                 }
             }
         } else {
-            Err(format!("no method {method}"))
+            Err(HostError::new(format!("no method {method}")))
         };
         let rid = msg.get("id").cloned().unwrap_or(Value::Null);
         let _ = self.send(&match reply {
             Ok(result) => json!({"jsonrpc": "2.0", "id": rid, "result": result}),
-            Err(message) => json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": message}}),
+            Err(refused) => json!({"jsonrpc": "2.0", "id": rid, "error": refused.to_error()}),
         });
     }
 
