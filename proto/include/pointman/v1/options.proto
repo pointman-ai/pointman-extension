@@ -66,6 +66,18 @@ extend google.protobuf.FieldOptions {
   repeated Caller set_by = 51007;
   // A field of settings.proto's: an app setting (TYPES-21).
   SettingOptions setting = 51008;
+  // Its key in today's JSON, where that isn't its name (TYPES-20: `thread` is stored as `thread_id`). Unlike
+  // json_name, the typed wire keeps the field's own name.
+  string v1_key = 51013;
+  // A `bytes` field that's a picture, by its media type (image/jpeg): an MCP tool's answer sends it as an image, after
+  // the words of the message that holds it (TYPES-14: the node's `look`).
+  string media = 51009;
+  // A string that's a board file, `pointman://asset/<id>` (`?v=` a version), in an extension command's params
+  // (MB-817): the node fetches it before the command runs, with the access of the member who asked for the job, and
+  // gives the extension its path on the machine instead. On a `repeated string`, each one; on a field of a message
+  // the params hold, there too. The SDK's `manifest write` puts it in the command's params as
+  // `format = "pointman-file"`, which is what the node reads (docs/dev/extensions.md, "Board files").
+  bool board_file = 51014;
 }
 
 extend google.protobuf.MessageOptions {
@@ -79,4 +91,8 @@ extend google.protobuf.MethodOptions {
   // Its MCP tool comes with an agent's session, not behind its client's tool search: what a woken run answers with
   // first (MB-203: finding a tool first is a whole model turn). Set on few: each costs every session its schema.
   bool always_load = 51011;
+  // It works on the caller's own machine (TYPES-14: a secret read, sealed or saved there; a file sent from there): core
+  // takes which machine, and the caller's folder on it, from the session its node vouches for, never from the request,
+  // and refuses the call when it can't tell. No slash command: a post has no machine.
+  bool from_machine = 51012;
 }

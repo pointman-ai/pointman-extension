@@ -68,6 +68,7 @@ pub(crate) struct Schemas {
     message_rules: Option<ExtensionDescriptor>,
     oneof_rules: Option<ExtensionDescriptor>,
     setting: Option<ExtensionDescriptor>,
+    board_file: Option<ExtensionDescriptor>,
     comments: HashMap<String, HashMap<Vec<i32>, String>>,
     /// the messages being written, inner last: one that holds itself can't be said inline
     stack: Vec<String>,
@@ -80,6 +81,7 @@ impl Schemas {
             message_rules: pool.get_extension_by_name("buf.validate.message"),
             oneof_rules: pool.get_extension_by_name("buf.validate.oneof"),
             setting: pool.get_extension_by_name("pointman.v1.setting"),
+            board_file: pool.get_extension_by_name("pointman.v1.board_file"),
             comments: HashMap::new(),
             stack: Vec::new(),
         }
@@ -197,7 +199,18 @@ impl Schemas {
         if let Some(field_rules) = self.extension(&f.options(), &self.field_rules.clone()) {
             required = rules(&what, f, &field_rules, &mut obj, true)?;
         }
+        if self.is_board_file(f) {
+            board_file(&what, f, &mut obj)?;
+        }
         Ok((Node::Obj(obj), required))
+    }
+
+    /// `(pointman.v1.board_file) = true` on the field.
+    fn is_board_file(&self, f: &FieldDescriptor) -> bool {
+        let options = f.options();
+        self.board_file
+            .as_ref()
+            .is_some_and(|ext| options.has_extension(ext) && options.get_extension(ext).as_bool() == Some(true))
     }
 
     /// The schema of one of a field's values (the field itself, a list's item, a map's value).
@@ -330,6 +343,41 @@ fn rules(
     }
     Ok(required)
 }
+
+/// A board file (`(pointman.v1.board_file)`): the node fetches each `pointman://asset/<id>` in it before the command
+/// runs and gives the extension its path, so it's `format = "pointman-file"` on the string: the field, a list's items
+/// or a map's values. Only a string can be one, and it says no other format.
+fn board_file(what: &str, f: &FieldDescriptor, obj: &mut Vec<(String, Node)>) -> anyhow::Result<()> {
+    let (kind, at) = if f.is_map() {
+        let Kind::Message(entry) = f.kind() else { unreachable!("a map's entry is a message") };
+        (entry.map_entry_value_field().kind(), Some("additionalProperties"))
+    } else if f.is_list() {
+        (f.kind(), Some("items"))
+    } else {
+        (f.kind(), None)
+    };
+    if !matches!(kind, Kind::String) {
+        bail!(
+            "{what}: (pointman.v1.board_file) is for a string (a pointman://asset/ link), not a {}",
+            kind_name(&kind)
+        );
+    }
+    let one = match at {
+        Some(key) => match get(obj, key) {
+            Some(Node::Obj(inner)) => inner,
+            _ => unreachable!("a list's items and a map's values are schemas"),
+        },
+        None => obj,
+    };
+    if let Some(Node::Str(other)) = get(one, "format") {
+        bail!("{what}: a board file is format pointman-file, so it can't also be {other}");
+    }
+    set(one, "format", s(BOARD_FILE));
+    Ok(())
+}
+
+/// The format the node fetches a board file for (MB-817).
+pub(crate) const BOARD_FILE: &str = "pointman-file";
 
 fn unmapped(what: &str, kind: &str, rule: &str) -> String {
     format!("{what}: (buf.validate.field).{kind}.{rule} has no JSON Schema keyword, so the manifest can't say it")

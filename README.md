@@ -113,8 +113,11 @@ message Settings {
   `const`; `required`, and a oneof's `required`. An enum is a string, its values' names in lower case without the
   enum's prefix (`PRIVACY_PUBLIC` is `public`, its `…_UNSPECIFIED` left out). A default is Pointman's own settings'
   option, `(pointman.v1.setting).default`, written as `pointman config` takes it (a word, a number, true or false, a
-  list joined by commas). A rule with no keyword is refused rather than left out, so the manifest never says less
-  than the proto. `buf/validate/validate.proto` and `pointman/v1/options.proto` come with the SDK (proto/include).
+  list joined by commas). `(pointman.v1.board_file) = true` on a string (or a `repeated string`, or a map's string
+  values) is `format = "pointman-file"`: a board file, `pointman://asset/<id>`, which the node fetches before the
+  command runs, with the access of whoever asked for the job, and gives the extension as a path on its machine. A rule
+  with no keyword is refused rather than left out, so the manifest never says less than the proto.
+  `buf/validate/validate.proto` and `pointman/v1/options.proto` come with the SDK (proto/include).
 - **The types:** with the SDK as a build dependency (`features = ["proto"]`), `pointman_extension::proto::build()` in
   build.rs makes buffa's types for the proto, and `mod proto { pointman_extension::include_proto!(); }` brings them in. Then a
   handler takes its params' message and answers its result's, and the settings read as `Settings`:
