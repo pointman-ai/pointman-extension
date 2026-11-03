@@ -15,8 +15,10 @@
 //! `gte`, `lt`, `lte`, `in`, `const`; a list's `min_items`, `max_items`, `unique`, `items`; a map's `min_pairs`,
 //! `max_pairs`, `values`; `required`); an enum is a string, one of its values' names in lower case without the enum's
 //! prefix (`PRIVACY_PUBLIC` is `public`), and `(pointman.v1.setting).default` is a field's `default`, written as
-//! Pointman's own settings write it (a word, a number, true or false, or a list joined by commas). A rule with no
-//! keyword is refused rather than left out, so the manifest never says less than the proto.
+//! Pointman's own settings write it (a word, a number, true or false, or a list joined by commas), and
+//! `(pointman.v1.board_file) = true` on a string is `format = "pointman-file"`, a board file the node fetches and gives
+//! as a path (on a list, its items; on a map, its values). A rule with no keyword is refused rather than left out, so
+//! the manifest never says less than the proto.
 //!
 //! Beside its own files, the proto may import google/protobuf's, `buf/validate/validate.proto` and
 //! `pointman/v1/options.proto`: the SDK has them (proto/include).

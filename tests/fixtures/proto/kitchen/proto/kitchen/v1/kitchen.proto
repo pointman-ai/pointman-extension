@@ -12,7 +12,7 @@ import "pointman/v1/options.proto";
 // Uploads a video to the channel.
 message UploadParams {
   // The video file: a board file or a path in the extension's folders.
-  string file = 1 [(buf.validate.field).required = true];
+  string file = 1 [(buf.validate.field).required = true, (pointman.v1.board_file) = true];
   // The video's title, as viewers see it.
   string title = 2 [(buf.validate.field).string = {min_len: 1, max_len: 100}];
   string description = 3 [(buf.validate.field).string.max_len = 5000];  // Below the video.
@@ -55,6 +55,9 @@ message UploadParams {
   repeated int64 sizes = 30;
   // Anything at all.
   google.protobuf.Value anything = 31;
+  // Files to attach: board files, each given as its path.
+  repeated string attachments = 32 [(pointman.v1.board_file) = true, (buf.validate.field).repeated.max_items = 10];
+  map<string, string> stills = 33 [(pointman.v1.board_file) = true];
 }
 
 // What an upload made.

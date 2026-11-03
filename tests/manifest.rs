@@ -76,7 +76,9 @@ fn every_rule_says_its_json_schema_keyword() {
         "description": "Uploads a video to the channel.",
         "properties": {
             // a comment above is its description; required is the schema's required
-            "file": {"type": "string", "description": "The video file: a board file or a path in the extension's folders."},
+            // (pointman.v1.board_file): a board file the node fetches, on the string, a list's items or a map's values
+            "file": {"type": "string", "description": "The video file: a board file or a path in the extension's folders.",
+                     "format": "pointman-file"},
             "title": {"type": "string", "description": "The video's title, as viewers see it.", "minLength": 1, "maxLength": 100},
             // a comment after it on its line, when there's none above
             "description": {"type": "string", "description": "Below the video.", "maxLength": 5000},
@@ -123,6 +125,9 @@ fn every_rule_says_its_json_schema_keyword() {
             "sizes": {"type": "array", "items": {"type": "integer"}},
             // google.protobuf.Value: any JSON, an empty schema
             "anything": {"description": "Anything at all."},
+            "attachments": {"type": "array", "description": "Files to attach: board files, each given as its path.",
+                            "items": {"type": "string", "format": "pointman-file"}, "maxItems": 10},
+            "stills": {"type": "object", "additionalProperties": {"type": "string", "format": "pointman-file"}},
         },
         "required": ["file"],
         // a message is closed: inputs are strict
@@ -261,6 +266,28 @@ fn a_rule_with_no_keyword_is_refused() {
         e.contains(
             "kitchen.v1.UploadParams.description: (buf.validate.field).string.prefix has no JSON Schema keyword"
         ),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_board_file_is_a_string() {
+    let (_dir, dir) = kitchen();
+    let file = dir.join("proto/kitchen/v1/kitchen.proto");
+    let text = std::fs::read_to_string(&file).unwrap();
+    let changed =
+        text.replace("repeated int64 sizes = 30;", "repeated int64 sizes = 30 [(pointman.v1.board_file) = true];");
+    assert_ne!(changed, text);
+    std::fs::write(&file, changed).unwrap();
+    let e = format!("{:#}", proto::check(&dir).unwrap_err());
+    assert!(e.contains("kitchen.v1.UploadParams.sizes: (pointman.v1.board_file) is for a string"), "{e}");
+    // and says no other format
+    let changed = text.replace("string.uri = true];", "string.uri = true, (pointman.v1.board_file) = true];");
+    assert_ne!(changed, text);
+    std::fs::write(&file, changed).unwrap();
+    let e = format!("{:#}", proto::check(&dir).unwrap_err());
+    assert!(
+        e.contains("kitchen.v1.UploadParams.link: a board file is format pointman-file, so it can't also be uri"),
         "{e}"
     );
 }
