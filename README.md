@@ -20,7 +20,7 @@ method's params and result are that method's messages, in protobuf's standard JS
 
 - A method's name is its rpc's: `PaneOpen` is `pane.open`, `CredentialsSignIn` is `credentials.sign_in`. An rpc that
   returns `Empty` is a notification (`Notification`); the rest are requests (`Request`, with their `Response`).
-  `pointman_extension::METHODS` lists all 58.
+  `pointman_extension::METHODS` lists all 60.
 - Lists stay open: an unknown method, field or enum value is skipped, never refused. A request for a method the SDK
   doesn't know is answered with an error; a notification is dropped.
 - An extension's own data (its settings, a command's params and result, its events, a board's items) is free-form in
