@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{example, source};
 use pointman_extension::testing::{PaneOptions, PaneView, StandIn};
-use pointman_extension::v1::{PaneContext, PaneFormat, ThreadRef};
+use pointman_extension::v1::{ChannelRef, PaneContext, PaneFormat};
 use pointman_extension::Extension;
 use serde_json::{json, Value};
 
@@ -34,9 +34,9 @@ fn count(block: Option<pointman_extension::v1::Block>) -> Value {
 #[test]
 fn a_pane_opens_with_its_manifest_format_and_inputs_edit_it() {
     let node = panes();
-    let thread = ThreadRef { id: "thr_1".into(), ..Default::default() };
+    let channel = ChannelRef { id: "ch_1".into(), ..Default::default() };
     let options =
-        PaneOptions { context: PaneContext { thread: thread.into(), ..Default::default() }, ..Default::default() };
+        PaneOptions { context: PaneContext { channel: channel.into(), ..Default::default() }, ..Default::default() };
     let view = node.open_pane_with("counter", json!({"start": 1}), options).unwrap();
     assert_eq!(view.format(), Some(PaneFormat::PANE_FORMAT_BLOCKS));
     let names: Vec<String> = view.blocks().iter().map(|b| b.name.clone().unwrap()).collect();
@@ -91,9 +91,9 @@ fn a_refused_input_says_why_and_changes_nothing() {
 fn context_and_close_reach_the_pane() {
     let node = panes();
     let view = node.open_pane("counter", Value::Null).unwrap();
-    let thread = ThreadRef { id: "thr_9".into(), ..Default::default() };
-    view.look_at(PaneContext { thread: thread.into(), ..Default::default() }).unwrap();
-    view.wait(WAIT, |v| v.block("seen").is_some_and(|b| json_of(Some(b))["text"]["markdown"] == "Looking at thr_9"))
+    let channel = ChannelRef { id: "ch_9".into(), ..Default::default() };
+    view.look_at(PaneContext { channel: channel.into(), ..Default::default() }).unwrap();
+    view.wait(WAIT, |v| v.block("seen").is_some_and(|b| json_of(Some(b))["text"]["markdown"] == "Looking at ch_9"))
         .unwrap();
     view.input_json(tap("plus")).unwrap();
     view.close("idle").unwrap();

@@ -55,7 +55,8 @@ def tool(node, name, arguments):
 
 
 def host(root, name, **kw):
-    h = ExtensionHost(root, node="test-node", machine="test-machine", state_dir=STATE / name, **kw)
+    h = ExtensionHost(root, node="test-node", machine="test-machine", state_dir=STATE / name, node_version="0.4.0",
+                      **kw)
     h.start()
     assert h.wait_ready(), h.error
     return h

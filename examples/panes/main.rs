@@ -103,8 +103,8 @@ fn main() -> anyhow::Result<()> {
         });
         let shows = view.clone();
         pane.on_context(move |pane: &Pane, context: &PaneContext| {
-            let thread = context.thread.as_option().map_or("nothing", |t| t.id.as_str());
-            *seen.lock().unwrap() = format!("Looking at {thread}");
+            let channel = context.channel.as_option().map_or("nothing", |c| c.id.as_str());
+            *seen.lock().unwrap() = format!("Looking at {channel}");
             pane.show(shows());
         });
         let closing = n.clone();
