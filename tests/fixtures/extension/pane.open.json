@@ -7,8 +7,8 @@
     "open": "live",
     "target": {},
     "context": {
-      "thread": {
-        "id": "thr_17979"
+      "channel": {
+        "id": "ch_17979"
       }
     },
     "viewer": {

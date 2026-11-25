@@ -225,7 +225,7 @@ impl Pane {
         &self.0.viewer
     }
 
-    /// What the person is looking at now: a thread, item, agent, post or file.
+    /// What the person is looking at now: a channel, item, agent, post or file.
     pub fn context(&self) -> PaneContext {
         read(&self.0.context).clone()
     }

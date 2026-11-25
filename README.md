@@ -188,7 +188,7 @@ ext.pane("view", |pane: &Pane| {
         pane.show(blocks("merged")); // only the block that changed goes: an edit by its name
         Ok(())
     });
-    pane.on_context(|pane: &Pane, context: &PaneContext| { /* the thread or item the person is on */ });
+    pane.on_context(|pane: &Pane, context: &PaneContext| { /* the channel or item the person is on */ });
     pane.on_close(|pane: &Pane, reason: &str| { /* stop what feeds it */ });
     // or PaneOpenResponse::board(&board), ::page("index.html"), ::video(Video { .. })
     Ok(PaneOpenResponse::blocks(blocks("open")).titled("PR 42"))
@@ -263,6 +263,19 @@ back and forth, and apply the shared edit cases (tests/fixtures/panes/edits.json
 Python node and template against these, when `POINTMAN_CORE` points at a checkout of Pointman's core
 (`POINTMAN_CORE_PYTHON`: a Python with its dependencies, if not its `.venv`). Without it, as on CI, those two are
 skipped.
+
+## Moving from 0.5 to 0.6: channels and their threads
+
+0.6 speaks the protocol of a node on the flatter board, and only that one: what was a thread is a channel (`ch_12`),
+and what was a post's side thread is that post's thread. The old fields are gone, with no aliases.
+
+| Where | 0.5 | 0.6 |
+|---|---|---|
+| board.post | `thread: ThreadRef`, `side_of: PostRef` | `channel: ChannelRef`, `in_thread: PostRef` (the thread's first post) |
+| agents.sessions' `AgentSessionOnMachine` | `thread: ThreadRef` | `channel: ChannelRef` |
+| `PaneContext` | `thread: ThreadRef` | `channel: ChannelRef` |
+| A command's params, when it posts where it was asked for | `thread_id` (core sets it) | `channel_id` |
+| files.publish's params | `thread_id`, `title` | `channel_id`, and `in_thread` for a post's thread |
 
 ## Moving from 0.4 to 0.5: references are `{id, name}`
 
