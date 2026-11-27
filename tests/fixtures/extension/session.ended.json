@@ -7,7 +7,7 @@
     "agent": {
       "name": "loupe"
     },
-    "client": "claude",
+    "harness": "claude",
     "account": "work",
     "status": "STATUS_LIMITED",
     "limits": {
